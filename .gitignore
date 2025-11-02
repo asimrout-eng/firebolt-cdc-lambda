@@ -1,0 +1,35 @@
+# CDK
+*.swp
+.cdk.staging/
+cdk.out/
+cdk.context.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+env/
+*.egg-info/
+
+# Lambda Layer
+lambda-layer/
+
+# Environment
+.env
+*.env
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+
+# AWS
+response.json
+

@@ -1,0 +1,24 @@
+🚀 FIREBOLT CDC LAMBDA - DEPLOYMENT PACKAGE
+============================================
+
+📦 You now have a complete CDK deployment package!
+
+QUICK START:
+-----------
+
+1. Configure Credentials:
+   cp .env.example .env
+   nano .env    # Add your Firebolt credentials
+
+2. Deploy:
+   ./scripts/deploy.sh
+
+3. Upload table keys:
+   aws s3 cp config/tables_keys.json s3://fcanalytics/firebolt-migration/config/tables_keys.json
+
+4. Create GitHub Page (optional):
+   ./setup-github.sh YOUR_GITHUB_USERNAME
+
+THAT'S IT! 🎉
+
+See QUICKSTART.md for details.

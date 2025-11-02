@@ -1,0 +1,6 @@
+{
+  "customers": ["customer_id"],
+  "orders": ["order_id"],
+  "order_items": ["order_id", "item_id"]
+}
+
