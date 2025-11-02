@@ -1,0 +1,38 @@
+⚠️  IMPORTANT - S3 CONFIGURATION UPDATE
+==========================================
+
+Lambda has access to: s3://fcanalytics/firebolt_dms_job/*
+
+Therefore, save table_keys.json to:
+  s3://fcanalytics/firebolt_dms_job/config/tables_keys.json
+
+UPDATE YOUR .env FILE:
+----------------------
+
+Change this line:
+  TABLE_KEYS_S3_KEY=firebolt-migration/config/tables_keys.json
+
+To this:
+  TABLE_KEYS_S3_KEY=firebolt_dms_job/config/tables_keys.json
+
+
+UPLOAD COMMAND:
+---------------
+
+macOS/Linux:
+  aws s3 cp config/tables_keys.json \
+    s3://fcanalytics/firebolt_dms_job/config/tables_keys.json
+
+Windows:
+  aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt_dms_job/config/tables_keys.json
+
+
+THEN REDEPLOY:
+--------------
+
+macOS/Linux:     ./scripts/deploy.sh
+Windows (PS):    .\scripts\deploy.ps1
+Windows (CMD):   scripts\deploy.bat
+
+
+See CONFIG_SETUP.md for detailed instructions.
