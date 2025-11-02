@@ -1,24 +1,46 @@
 🚀 FIREBOLT CDC LAMBDA - DEPLOYMENT PACKAGE
 ============================================
 
-📦 You now have a complete CDK deployment package!
+📦 Cross-Platform Support: macOS | Linux | Windows
 
 QUICK START:
 -----------
 
 1. Configure Credentials:
+
+   macOS/Linux:
    cp .env.example .env
    nano .env    # Add your Firebolt credentials
 
+   Windows (PowerShell):
+   Copy-Item .env.example .env
+   notepad .env
+
+   Windows (CMD):
+   copy .env.example .env
+   notepad .env
+
 2. Deploy:
+
+   macOS/Linux:
+   chmod +x scripts/*.sh
    ./scripts/deploy.sh
 
+   Windows (PowerShell):
+   .\scripts\deploy.ps1
+
+   Windows (CMD):
+   scripts\deploy.bat
+
 3. Upload table keys:
+
+   macOS/Linux:
    aws s3 cp config/tables_keys.json s3://fcanalytics/firebolt-migration/config/tables_keys.json
 
-4. Create GitHub Page (optional):
-   ./setup-github.sh YOUR_GITHUB_USERNAME
+   Windows:
+   aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tables_keys.json
 
 THAT'S IT! 🎉
 
-See QUICKSTART.md for details.
+📖 See CROSS_PLATFORM_GUIDE.md for detailed instructions.
+📖 See QUICKSTART.md for quick reference.

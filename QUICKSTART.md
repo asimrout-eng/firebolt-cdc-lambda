@@ -1,13 +1,34 @@
 # Quick Start Guide
 
+## 🖥️ Choose Your Platform
+
+This guide supports **macOS**, **Linux**, and **Windows**.
+
+---
+
 ## 🚀 Get Started in 3 Steps
 
 ### 1. Configure Credentials
 
+**macOS / Linux:**
 ```bash
 cd firebolt-cdk-package
 cp .env.example .env
 nano .env  # Add your Firebolt credentials
+```
+
+**Windows (PowerShell):**
+```powershell
+cd firebolt-cdk-package
+Copy-Item .env.example .env
+notepad .env  # Add your Firebolt credentials
+```
+
+**Windows (Command Prompt):**
+```cmd
+cd firebolt-cdk-package
+copy .env.example .env
+notepad .env
 ```
 
 Required fields in `.env`:
@@ -20,8 +41,20 @@ FIREBOLT_PASSWORD=your_password
 
 ### 2. Deploy to AWS
 
+**macOS / Linux:**
 ```bash
+chmod +x scripts/*.sh
 ./scripts/deploy.sh
+```
+
+**Windows (PowerShell):**
+```powershell
+.\scripts\deploy.ps1
+```
+
+**Windows (Command Prompt):**
+```cmd
+scripts\deploy.bat
 ```
 
 This will:
@@ -31,6 +64,7 @@ This will:
 
 ### 3. Upload Table Keys
 
+**macOS / Linux:**
 ```bash
 # Copy example
 cp config/tables_keys.json.example config/tables_keys.json
@@ -41,6 +75,16 @@ aws s3 cp config/tables_keys.json \
   s3://fcanalytics/firebolt-migration/config/tables_keys.json
 ```
 
+**Windows:**
+```powershell
+# Copy example
+Copy-Item config\tables_keys.json.example config\tables_keys.json
+notepad config\tables_keys.json  # Edit with your tables
+
+# Upload to S3
+aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tables_keys.json
+```
+
 ## ✅ Done!
 
 Your Lambda will now automatically process `.parquet` files from:
@@ -48,7 +92,7 @@ Your Lambda will now automatically process `.parquet` files from:
 s3://fcanalytics/firebolt_dms_job/**/*.parquet
 ```
 
-## 📊 Monitor
+## 📊 Monitor (All Platforms)
 
 ```bash
 # View logs
@@ -71,7 +115,24 @@ Your page: `https://YOUR_USERNAME.github.io/firebolt-cdc-lambda/`
 
 ## 🗑️ Cleanup
 
+**macOS / Linux:**
 ```bash
 ./scripts/destroy.sh
 ```
+
+**Windows (PowerShell):**
+```powershell
+.\scripts\destroy.ps1
+```
+
+**Windows (Command Prompt):**
+```cmd
+scripts\destroy.bat
+```
+
+---
+
+## 📖 Need More Details?
+
+See [CROSS_PLATFORM_GUIDE.md](CROSS_PLATFORM_GUIDE.md) for platform-specific instructions and troubleshooting.
 
