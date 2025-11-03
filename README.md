@@ -6,27 +6,27 @@
 
 Automated AWS Lambda for processing CDC files from S3 into Firebolt using AWS CDK.
 
-**✅ Cross-platform support:** macOS, Linux, and Windows
+**Cross-platform support:** macOS, Linux, and Windows
 
-## ✨ Features
+##  Features
 
-- ✅ **One-command deployment** - Deploy with `./scripts/deploy.sh`
-- ✅ **S3 Auto-trigger** - Processes new `.parquet` files automatically  
-- ✅ **Concurrent safe** - Multiple files processed simultaneously
-- ✅ **Transaction safe** - MERGE with rollback support
-- ✅ **Infrastructure as Code** - AWS CDK (Python)
+-  **One-command deployment** - Deploy with `./scripts/deploy.sh`
+-  **S3 Auto-trigger** - Processes new `.parquet` files automatically  
+-  **Concurrent safe** - Multiple files processed simultaneously
+-  **Transaction safe** - MERGE with rollback support
+-  **Infrastructure as Code** - AWS CDK (Python)
 
-## 📋 Prerequisites
+##  Prerequisites
 
 - AWS CLI configured
 - AWS CDK CLI: `npm install -g aws-cdk`
 - Python 3.11+
 
-**📖 Detailed setup guides:**
+** Detailed setup guides:**
 - [Linux Setup Guide](LINUX_SETUP.md) - Complete Linux installation guide
 - [Cross-Platform Guide](CROSS_PLATFORM_GUIDE.md) - macOS, Linux, Windows
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### macOS / Linux
 
@@ -72,9 +72,9 @@ REM 3. Upload table keys
 aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tables_keys.json
 ```
 
-**📖 Detailed guide:** See [CROSS_PLATFORM_GUIDE.md](CROSS_PLATFORM_GUIDE.md)
+** Detailed guide:** See [CROSS_PLATFORM_GUIDE.md](CROSS_PLATFORM_GUIDE.md)
 
-## 📖 Documentation
+##  Documentation
 
 ### Setup Guides
 - [Linux Setup Guide](LINUX_SETUP.md) - Complete Linux installation & deployment
@@ -86,7 +86,7 @@ aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tab
 - [GitHub Setup](GITHUB_SETUP.md) - Create GitHub page
 - [Important S3 Config](IMPORTANT_S3_CONFIG.txt) - S3 location setup
 
-## 🗑️ Cleanup
+##  Cleanup
 
 **macOS / Linux:**
 ```bash
@@ -98,11 +98,6 @@ aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tab
 .\scripts\destroy.ps1    # PowerShell
 scripts\destroy.bat      # Command Prompt
 ```
-
-## 📄 License
-
-MIT
-
 ---
 
 **Made for Firebolt CDC Pipelines** ❤️
