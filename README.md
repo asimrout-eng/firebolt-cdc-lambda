@@ -22,6 +22,10 @@ Automated AWS Lambda for processing CDC files from S3 into Firebolt using AWS CD
 - AWS CDK CLI: `npm install -g aws-cdk`
 - Python 3.11+
 
+**📖 Detailed setup guides:**
+- [Linux Setup Guide](LINUX_SETUP.md) - Complete Linux installation guide
+- [Cross-Platform Guide](CROSS_PLATFORM_GUIDE.md) - macOS, Linux, Windows
+
 ## 🚀 Quick Start
 
 ### macOS / Linux
@@ -72,9 +76,15 @@ aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tab
 
 ## 📖 Documentation
 
+### Setup Guides
+- [Linux Setup Guide](LINUX_SETUP.md) - Complete Linux installation & deployment
 - [Cross-Platform Guide](CROSS_PLATFORM_GUIDE.md) - macOS, Linux, Windows
+- [Configuration Setup](CONFIG_SETUP.md) - Table keys and S3 configuration
+
+### Quick References
 - [Quick Start](QUICKSTART.md) - Fast deployment
 - [GitHub Setup](GITHUB_SETUP.md) - Create GitHub page
+- [Important S3 Config](IMPORTANT_S3_CONFIG.txt) - S3 location setup
 
 ## 🗑️ Cleanup
 
