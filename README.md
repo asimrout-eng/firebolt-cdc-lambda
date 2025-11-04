@@ -18,11 +18,17 @@ Automated AWS Lambda for processing CDC files from S3 into Firebolt using AWS CD
 
 ##  Prerequisites
 
-- AWS CLI configured
-- AWS CDK CLI: `npm install -g aws-cdk`
-- Python 3.11+
+⚠️ **IMPORTANT:** Python 3.9+ required (3.11+ recommended)
+- `firebolt-sdk` requires Python 3.9 or higher
+- If you have Python 3.8 or older, see [Python Upgrade Guide](#python-version-requirements)
 
-** Detailed setup guides:**
+**Required:**
+- AWS CLI configured (`aws configure`)
+- AWS CDK CLI: `npm install -g aws-cdk`
+- Python 3.11+ (3.9 minimum)
+- Node.js 18+ (for CDK)
+
+**Detailed setup guides:**
 - [Linux Setup Guide](LINUX_SETUP.md) - Complete Linux installation guide
 - [Cross-Platform Guide](CROSS_PLATFORM_GUIDE.md) - macOS, Linux, Windows
 
@@ -85,6 +91,52 @@ aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tab
 - [Quick Start](QUICKSTART.md) - Fast deployment
 - [GitHub Setup](GITHUB_SETUP.md) - Create GitHub page
 - [Important S3 Config](IMPORTANT_S3_CONFIG.txt) - S3 location setup
+
+##  Troubleshooting
+
+### Python Version Requirements
+
+**Error:** `firebolt-sdk requires python > 3.9`
+
+**Solution:** Upgrade Python to 3.9 or higher (3.11+ recommended)
+
+**Quick Fixes:**
+
+**Ubuntu/Debian:**
+```bash
+sudo apt update
+sudo apt install python3.11 python3.11-venv -y
+```
+
+**macOS:**
+```bash
+brew install python@3.11
+```
+
+**Windows:**
+- Download from: https://www.python.org/downloads/
+- Or: `winget install Python.Python.3.11`
+
+**Verify:**
+```bash
+python3 --version  # Should show 3.9+ (3.11+ recommended)
+```
+
+For detailed upgrade instructions, see the full [Python Upgrade Guide](../PYTHON_UPGRADE_GUIDE.md).
+
+### Other Common Issues
+
+**Error:** `pip: command not found`
+- **Solution:** Script now uses `pip3` (fixed in latest version)
+- Update: `git pull origin main`
+
+**Error:** `cdk: command not found`
+- **Solution:** Install AWS CDK: `npm install -g aws-cdk`
+
+**Error:** `Access Denied` / IAM permissions
+- **Solution:** Ensure IAM user has required permissions (see documentation)
+
+---
 
 ##  Cleanup
 
