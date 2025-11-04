@@ -12,11 +12,11 @@ if [ ! -f .env ]; then
 fi
 
 # Install dependencies
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 
 # Build Lambda layer
 mkdir -p lambda-layer/python
-pip install -r lambda/requirements.txt -t lambda-layer/python/ \
+pip3 install -r lambda/requirements.txt -t lambda-layer/python/ \
     --platform manylinux2014_x86_64 --only-binary=:all: --python-version 3.11
 
 # Bootstrap (first time)
