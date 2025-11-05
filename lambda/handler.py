@@ -137,10 +137,10 @@ def ensure_staging_like(table, staging_suffix, fb_connector):
     logger.info(f"✓ Staging table {staging_table} ready")
     return staging_table
 
-def render_copy_single_file(staging_table, table, date_yyyymmdd, filename, location, database):
+def render_copy_single_file(staging_table, table, date_path, filename, location, database):
     """Generate COPY statement for single file - DMS format"""
-    # DMS format: database/table/YYYYMMDD/filename
-    pattern = f'{database}/{table}/{date_yyyymmdd}/{filename}'
+    # DMS format: database/table/YYYY/MM/DD/filename
+    pattern = f'{database}/{table}/{date_path}/{filename}'
     
     return (
         f'COPY "public"."{staging_table}"\n'
@@ -190,8 +190,8 @@ def cleanup_staging_table(staging_table, fb_connector):
         logger.warning(f"Failed to cleanup staging table: {e}")
 
 # Regex to extract database, table, date, filename from S3 key
-# DMS format: firebolt_dms_job/<database>/<table>/YYYYMMDD/<filename>.parquet
-RE_KEY = re.compile(r'firebolt_dms_job/([^/]+)/([^/]+)/(\d{8})/([^/]+\.parquet)$')
+# DMS format: firebolt_dms_job/<database>/<table>/YYYY/MM/DD/<filename>.parquet
+RE_KEY = re.compile(r'firebolt_dms_job/([^/]+)/([^/]+)/(\d{4})/(\d{2})/(\d{2})/([^/]+\.parquet)$')
 
 def handler(event, context):
     """
@@ -213,12 +213,14 @@ def handler(event, context):
     
     logger.info(f"Processing S3 key: {key}")
     
-    # Parse database, table, date, filename from key
+    # Parse database, table, date components, filename from key
     m = RE_KEY.search(key or "")
     if not m:
         raise RuntimeError(f"Cannot parse database/table/date/filename from key: {key}")
     
-    database, table, date_yyyymmdd, filename = m.group(1), m.group(2), m.group(3), m.group(4)
+    database, table, year, month, day, filename = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6)
+    date_yyyymmdd = f"{year}{month}{day}"  # For internal tracking
+    date_path = f"{year}/{month}/{day}"    # For S3 COPY pattern
     logger.info(f"Database: {database}, Table: {table}, Date: {date_yyyymmdd}, File: {filename}")
     
     # Create unique suffix for staging table (prevents concurrency issues)
@@ -271,7 +273,7 @@ def handler(event, context):
         staging_table = ensure_staging_like(table, unique_suffix, fb_connector)
         
         # COPY single file to staging
-        copy_sql = render_copy_single_file(staging_table, table, date_yyyymmdd, filename, location, database)
+        copy_sql = render_copy_single_file(staging_table, table, date_path, filename, location, database)
         fb_connector.execute(copy_sql)
         logger.info(f"✓ Copied {filename} to {staging_table}")
         
