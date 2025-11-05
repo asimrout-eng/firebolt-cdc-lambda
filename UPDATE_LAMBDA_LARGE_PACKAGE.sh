@@ -35,9 +35,14 @@ echo "✓ Files copied"
 echo ""
 echo "Step 2: Installing dependencies (this may take 1-2 minutes)..."
 
-pip3 install -r requirements.txt -t . --quiet --no-cache-dir
+# Install with platform-specific wheels for Lambda (Amazon Linux 2)
+pip3 install -r requirements.txt -t . \
+  --platform manylinux2014_x86_64 \
+  --only-binary=:all: \
+  --quiet \
+  --no-cache-dir
 
-echo "✓ Dependencies installed"
+echo "✓ Dependencies installed (Lambda-compatible)"
 
 echo ""
 echo "Step 3: Creating zip package..."
