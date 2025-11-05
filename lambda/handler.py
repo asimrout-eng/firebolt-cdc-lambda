@@ -225,7 +225,7 @@ def handler(event, context):
     
     # Create unique suffix for staging table (prevents concurrency issues)
     unique_suffix = hashlib.md5(
-        f"{table}_{date_yyyymmdd}_{filename}_{context.request_id}".encode()
+        f"{table}_{date_yyyymmdd}_{filename}_{context.aws_request_id}".encode()
     ).hexdigest()[:8]
     
     # Load table keys configuration
