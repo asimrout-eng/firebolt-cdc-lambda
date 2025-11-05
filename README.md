@@ -22,15 +22,22 @@ Automated AWS Lambda for processing CDC files from S3 into Firebolt using AWS CD
 - `firebolt-sdk` requires Python 3.9 or higher
 - If you have Python 3.8 or older, see [Python Upgrade Guide](#python-version-requirements)
 
+🔐 **IAM Permissions Required:**
+- See [IAM Permissions Guide](IAM_PERMISSIONS_REQUIRED.md) for complete list
+- Quick option: Attach `AWSLambda_FullAccess`, `IAMFullAccess`, `AmazonS3FullAccess`
+- Secure option: Use the custom least-privilege policy in the guide
+
 **Required:**
 - AWS CLI configured (`aws configure`)
 - AWS CDK CLI: `npm install -g aws-cdk`
 - Python 3.11+ (3.9 minimum)
 - Node.js 18+ (for CDK)
+- AWS IAM permissions (see above)
 
 **Detailed setup guides:**
 - [Linux Setup Guide](LINUX_SETUP.md) - Complete Linux installation guide
 - [Cross-Platform Guide](CROSS_PLATFORM_GUIDE.md) - macOS, Linux, Windows
+- [IAM Permissions Guide](IAM_PERMISSIONS_REQUIRED.md) - Required AWS permissions
 
 ##  Quick Start
 
@@ -86,6 +93,7 @@ aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tab
 - [Linux Setup Guide](LINUX_SETUP.md) - Complete Linux installation & deployment
 - [Cross-Platform Guide](CROSS_PLATFORM_GUIDE.md) - macOS, Linux, Windows
 - [Configuration Setup](CONFIG_SETUP.md) - Table keys and S3 configuration
+- [IAM Permissions Guide](IAM_PERMISSIONS_REQUIRED.md) - Required AWS permissions
 
 ### Quick References
 - [Quick Start](QUICKSTART.md) - Fast deployment

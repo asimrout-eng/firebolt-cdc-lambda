@@ -3,6 +3,9 @@
 
 📦 Cross-Platform Support: macOS | Linux | Windows
 
+⚠️  IMPORTANT: Ensure your AWS IAM user has required permissions
+    See IAM_PERMISSIONS_REQUIRED.md for details
+
 QUICK START:
 -----------
 
@@ -42,5 +45,8 @@ QUICK START:
 
 THAT'S IT! 🎉
 
-📖 See CROSS_PLATFORM_GUIDE.md for detailed instructions.
-📖 See QUICKSTART.md for quick reference.
+📖 DOCUMENTATION:
+   - CROSS_PLATFORM_GUIDE.md - Detailed platform-specific instructions
+   - QUICKSTART.md - Quick reference guide
+   - IAM_PERMISSIONS_REQUIRED.md - AWS permissions needed
+   - CONFIG_SETUP.md - S3 and table configuration

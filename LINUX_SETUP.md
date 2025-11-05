@@ -253,7 +253,7 @@ LAMBDA_MEMORY_SIZE=512
 # ============================================
 # FIREBOLT CREDENTIALS (REQUIRED)
 # ============================================
-FIREBOLT_ACCOUNT=faircent
+FIREBOLT_ACCOUNT=faircentindia
 FIREBOLT_DATABASE=your_database_name
 FIREBOLT_ENGINE=your_engine_name
 FIREBOLT_USERNAME=your@email.com
