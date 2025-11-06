@@ -297,8 +297,11 @@ def handler(event, context):
         logger.info(f"✓ Using {len(cols)} common columns for MERGE (production: {len(cols_production)}, staging: {len(cols_staging)})")
         
         # Execute MERGE in transaction
-        fb_connector.execute("BEGIN;")
+        transaction_started = False
         try:
+            fb_connector.execute("BEGIN;")
+            transaction_started = True
+            
             merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr)
             fb_connector.execute(merge_sql)
             
@@ -309,10 +312,20 @@ def handler(event, context):
                 rows_affected = "unknown"
             
             fb_connector.execute("COMMIT;")
+            transaction_started = False  # Transaction completed
             logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
+            
         except Exception as e:
-            fb_connector.execute("ROLLBACK;")
-            logger.error(f"✗ MERGE failed for {table}, rolled back: {e}")
+            # Only rollback if transaction was actually started
+            if transaction_started:
+                try:
+                    fb_connector.execute("ROLLBACK;")
+                    logger.info("✓ Transaction rolled back")
+                except Exception as rollback_error:
+                    logger.warning(f"Failed to rollback transaction: {rollback_error}")
+                    # Don't raise - the original error is more important
+            
+            logger.error(f"✗ MERGE failed for {table}: {e}")
             logger.error(f"   Columns used: {cols}")
             logger.error(f"   Primary keys: {keys}")
             raise
