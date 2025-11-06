@@ -123,11 +123,11 @@ def ensure_staging_like(table, staging_suffix, fb_connector):
     """Create unique staging table for this Lambda invocation"""
     staging_table = f"stg_{table}_{staging_suffix}"
     
-    # Create staging table with same schema as production (Firebolt-compatible syntax)
-    # Use CREATE TABLE AS SELECT with WHERE 1=0 to get empty table with same schema
+    # Create staging table by cloning production schema without indexes
+    # EXCLUDING INDEXES makes inserts faster for staging operations
     create_sql = f'''
     CREATE TABLE IF NOT EXISTS "public"."{staging_table}" 
-    AS SELECT * FROM "public"."{table}" WHERE 1=0
+    CLONE "public"."{table}" EXCLUDING INDEXES
     '''
     fb_connector.execute(create_sql)
     
