@@ -265,25 +265,56 @@ def handler(event, context):
         # Generate unique staging table name (table will be auto-created by COPY)
         staging_table = ensure_staging_table_name(table, unique_suffix)
         
+        # Drop staging table if it exists (from previous failed run)
+        cleanup_staging_table(staging_table, fb_connector)
+        
         # COPY single file to staging (AUTO_CREATE will infer schema from parquet)
         copy_sql = render_copy_single_file(staging_table, table, date_path, filename, location, database)
         fb_connector.execute(copy_sql)
         logger.info(f"✓ Copied {filename} to {staging_table} (auto-created from parquet schema)")
         
-        # Get column list from staging table (created from parquet with actual data types)
-        cols = get_columns("public", staging_table, fb_connector)
-        logger.info(f"✓ Retrieved {len(cols)} columns from staging table")
+        # Get column list from PRODUCTION table (not staging) to ensure schema compatibility
+        # We only merge columns that exist in production
+        cols_production = get_columns("public", table, fb_connector)
+        
+        # Get columns from staging to verify overlap
+        cols_staging = get_columns("public", staging_table, fb_connector)
+        
+        # Use intersection of columns (only columns present in both tables)
+        cols = [c for c in cols_production if c in cols_staging]
+        
+        if not cols:
+            raise RuntimeError(f"No common columns between staging and production table '{table}'")
+        
+        # Verify primary keys are in the common column list
+        missing_keys = [k for k in keys if k not in cols]
+        if missing_keys:
+            raise RuntimeError(
+                f"Primary keys {missing_keys} not found in common columns for table '{table}'. "
+                f"Production columns: {cols_production}, Staging columns: {cols_staging}"
+            )
+        
+        logger.info(f"✓ Using {len(cols)} common columns for MERGE (production: {len(cols_production)}, staging: {len(cols_staging)})")
         
         # Execute MERGE in transaction
         fb_connector.execute("BEGIN;")
         try:
             merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr)
             fb_connector.execute(merge_sql)
+            
+            # Get row count if possible (optional, some DBs return this)
+            try:
+                rows_affected = fb_connector.cursor.rowcount if hasattr(fb_connector.cursor, 'rowcount') else "unknown"
+            except:
+                rows_affected = "unknown"
+            
             fb_connector.execute("COMMIT;")
-            logger.info(f"✓ MERGE completed for {table}")
+            logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
         except Exception as e:
             fb_connector.execute("ROLLBACK;")
-            logger.error(f"✗ MERGE failed, rolled back: {e}")
+            logger.error(f"✗ MERGE failed for {table}, rolled back: {e}")
+            logger.error(f"   Columns used: {cols}")
+            logger.error(f"   Primary keys: {keys}")
             raise
         
         # Cleanup staging table
