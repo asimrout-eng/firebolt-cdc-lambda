@@ -123,10 +123,11 @@ def ensure_staging_like(table, staging_suffix, fb_connector):
     """Create unique staging table for this Lambda invocation"""
     staging_table = f"stg_{table}_{staging_suffix}"
     
-    # Create staging table like production
+    # Create staging table with same schema as production (Firebolt-compatible syntax)
+    # Use CREATE TABLE AS SELECT with WHERE 1=0 to get empty table with same schema
     create_sql = f'''
-    CREATE FACT TABLE IF NOT EXISTS "public"."{staging_table}" 
-    LIKE "public"."{table}"
+    CREATE TABLE IF NOT EXISTS "public"."{staging_table}" 
+    AS SELECT * FROM "public"."{table}" WHERE 1=0
     '''
     fb_connector.execute(create_sql)
     
