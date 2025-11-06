@@ -119,6 +119,23 @@ def get_columns(schema, table, fb_connector):
     # Extract column names from tuples
     return [row[0] for row in rows]
 
+def get_column_types(schema, table, fb_connector):
+    """Get column names and data types for a table"""
+    q = (
+        "SELECT column_name, data_type "
+        "FROM information_schema.columns "
+        f"WHERE table_schema = '{schema}' AND table_name = '{table}' "
+        "ORDER BY ordinal_position;"
+    )
+    cursor = fb_connector.execute(q)
+    rows = cursor.fetchall()
+    
+    if not rows:
+        raise ValueError(f"Table {schema}.{table} not found or has no columns")
+    
+    # Return dict {column_name: data_type}
+    return {row[0]: row[1] for row in rows}
+
 def ensure_staging_table_name(table, staging_suffix):
     """Generate unique staging table name for this Lambda invocation"""
     staging_table = f"stg_{table}_{staging_suffix}"
@@ -146,9 +163,21 @@ def render_copy_single_file(staging_table, table, date_path, filename, location,
         ');\n'
     )
 
-def render_merge(table, staging_table, cols, key_cols, delete_expr=None):
-    """Generate MERGE statement"""
-    on_clause = " AND ".join([f't."{k}" = s."{k}"' for k in key_cols])
+def render_merge(table, staging_table, cols, key_cols, delete_expr=None, key_cols_safe=None):
+    """Generate MERGE statement
+    
+    Args:
+        table: Target table name
+        staging_table: Staging table name
+        cols: List of columns to merge (intersection of staging and production)
+        key_cols: Original primary key columns
+        delete_expr: Optional delete expression for CDC
+        key_cols_safe: Filtered primary keys (excludes DECIMAL columns) for ON clause
+    """
+    # Use safe key columns for ON clause (without DECIMALs) if provided
+    on_keys = key_cols_safe if key_cols_safe else key_cols
+    on_clause = " AND ".join([f't."{k}" = s."{k}"' for k in on_keys])
+    
     non_keys = [c for c in cols if c not in key_cols]
     set_clause = ",\n    ".join([f'"{c}" = s."{c}"' for c in non_keys]) if non_keys else None
     cols_csv = ", ".join([f'"{c}"' for c in cols])
@@ -244,14 +273,9 @@ def handler(event, context):
     logger.info(f"Primary keys for {table}: {keys}")
     
     # Optional: Handle CDC deletes (tombstones)
+    # Note: delete_expr will be validated later (after we know staging table columns)
     delete_col = os.environ.get("CDC_DELETE_COLUMN")
     delete_vals = os.environ.get("CDC_DELETE_VALUES")
-    delete_expr = None
-    if delete_col and delete_vals:
-        in_list = ", ".join([f"'{v.strip()}'" for v in delete_vals.split(",") if v.strip()])
-        if in_list:
-            delete_expr = f's."{delete_col}" IN ({in_list})'
-            logger.info(f"Delete expression: {delete_expr}")
     
     # Connect to Firebolt using SDK
     fb_connector = FireboltConnector()
@@ -277,8 +301,10 @@ def handler(event, context):
         # We only merge columns that exist in production
         cols_production = get_columns("public", table, fb_connector)
         
-        # Get columns from staging to verify overlap
+        # Get columns and data types from staging table
         cols_staging = get_columns("public", staging_table, fb_connector)
+        col_types_staging = get_column_types("public", staging_table, fb_connector)
+        col_types_production = get_column_types("public", table, fb_connector)
         
         # Use intersection of columns (only columns present in both tables)
         cols = [c for c in cols_production if c in cols_staging]
@@ -294,7 +320,44 @@ def handler(event, context):
                 f"Production columns: {cols_production}, Staging columns: {cols_staging}"
             )
         
+        # Filter out DECIMAL columns from primary keys for ON clause
+        # (Firebolt can't compare DECIMALs with different precision/scale)
+        key_cols_safe = []
+        decimal_keys_removed = []
+        for k in keys:
+            prod_type = col_types_production.get(k, "")
+            stg_type = col_types_staging.get(k, "")
+            
+            # Skip DECIMAL columns in ON clause if types differ
+            if "DECIMAL" in prod_type.upper() or "NUMERIC" in prod_type.upper():
+                if prod_type != stg_type:
+                    decimal_keys_removed.append(f"{k} (prod: {prod_type}, stg: {stg_type})")
+                    logger.warning(f"Skipping DECIMAL key '{k}' from ON clause due to type mismatch")
+                    continue
+            
+            key_cols_safe.append(k)
+        
+        # Fallback: if all keys are DECIMALs with different precision, use them anyway (will fail but with clear error)
+        if not key_cols_safe:
+            logger.warning(f"All primary keys are DECIMAL with different precision! Using original keys (MERGE may fail)")
+            key_cols_safe = keys
+        
+        if decimal_keys_removed:
+            logger.warning(f"DECIMAL keys removed from ON clause: {decimal_keys_removed}")
+        
         logger.info(f"✓ Using {len(cols)} common columns for MERGE (production: {len(cols_production)}, staging: {len(cols_staging)})")
+        logger.info(f"✓ Primary keys for ON clause: {key_cols_safe}")
+        
+        # Validate CDC delete expression (only if delete column exists in staging)
+        delete_expr = None
+        if delete_col and delete_vals:
+            if delete_col in cols_staging:
+                in_list = ", ".join([f"'{v.strip()}'" for v in delete_vals.split(",") if v.strip()])
+                if in_list:
+                    delete_expr = f's."{delete_col}" IN ({in_list})'
+                    logger.info(f"✓ CDC delete expression: {delete_expr}")
+            else:
+                logger.warning(f"CDC delete column '{delete_col}' not found in staging table, skipping delete handling")
         
         # Execute MERGE in transaction
         transaction_started = False
@@ -302,7 +365,7 @@ def handler(event, context):
             fb_connector.execute("BEGIN;")
             transaction_started = True
             
-            merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr)
+            merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr, key_cols_safe=key_cols_safe)
             fb_connector.execute(merge_sql)
             
             # Get row count if possible (optional, some DBs return this)
