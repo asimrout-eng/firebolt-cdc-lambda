@@ -119,23 +119,15 @@ def get_columns(schema, table, fb_connector):
     # Extract column names from tuples
     return [row[0] for row in rows]
 
-def ensure_staging_like(table, staging_suffix, fb_connector):
-    """Create unique staging table for this Lambda invocation"""
+def ensure_staging_table_name(table, staging_suffix):
+    """Generate unique staging table name for this Lambda invocation"""
     staging_table = f"stg_{table}_{staging_suffix}"
     
-    # Create staging table by cloning production schema without indexes
-    # EXCLUDING INDEXES makes inserts faster for staging operations
-    create_sql = f'''
-    CREATE TABLE IF NOT EXISTS "public"."{staging_table}" 
-    CLONE "public"."{table}" EXCLUDING INDEXES
-    '''
-    fb_connector.execute(create_sql)
+    # Note: Staging table will be auto-created by COPY command
+    # This avoids schema mismatches between parquet and Firebolt table
+    # (e.g., DMS writes BLOB as bytea, Firebolt expects text)
     
-    # Truncate (in case it already exists from previous run)
-    truncate_sql = f'TRUNCATE TABLE "public"."{staging_table}"'
-    fb_connector.execute(truncate_sql)
-    
-    logger.info(f"✓ Staging table {staging_table} ready")
+    logger.info(f"Staging table name: {staging_table}")
     return staging_table
 
 def render_copy_single_file(staging_table, table, date_path, filename, location, database):
@@ -149,7 +141,7 @@ def render_copy_single_file(staging_table, table, date_path, filename, location,
         'WITH (\n'
         f"  PATTERN = '{pattern}',\n"
         '  TYPE = PARQUET,\n'
-        '  AUTO_CREATE = FALSE,\n'
+        '  AUTO_CREATE = TRUE,\n'  # Let Firebolt infer schema from parquet
         "  MAX_ERRORS_PER_FILE = '0%'\n"
         ');\n'
     )
@@ -270,17 +262,17 @@ def handler(event, context):
     
     staging_table = None
     try:
-        # Create unique staging table
-        staging_table = ensure_staging_like(table, unique_suffix, fb_connector)
+        # Generate unique staging table name (table will be auto-created by COPY)
+        staging_table = ensure_staging_table_name(table, unique_suffix)
         
-        # COPY single file to staging
+        # COPY single file to staging (AUTO_CREATE will infer schema from parquet)
         copy_sql = render_copy_single_file(staging_table, table, date_path, filename, location, database)
         fb_connector.execute(copy_sql)
-        logger.info(f"✓ Copied {filename} to {staging_table}")
+        logger.info(f"✓ Copied {filename} to {staging_table} (auto-created from parquet schema)")
         
-        # Get column list from production table
-        cols = get_columns("public", table, fb_connector)
-        logger.info(f"✓ Retrieved {len(cols)} columns for {table}")
+        # Get column list from staging table (created from parquet with actual data types)
+        cols = get_columns("public", staging_table, fb_connector)
+        logger.info(f"✓ Retrieved {len(cols)} columns from staging table")
         
         # Execute MERGE in transaction
         fb_connector.execute("BEGIN;")
