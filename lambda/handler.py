@@ -85,13 +85,17 @@ class FireboltConnector:
             raise
     
     def execute(self, sql: str) -> Any:
-        """Execute SQL and return results"""
+        """Execute SQL and return results (raw SQL, no prepared statements)"""
         logger.info("SQL>> %s", sql[:200] + "..." if len(sql) > 200 else sql)
         try:
-            self.cursor.execute(sql)
+            # Force raw SQL execution (no prepared statements)
+            # Firebolt doesn't support prepared statements for MERGE
+            # Use string directly, no parameters
+            self.cursor.execute(str(sql))
             return self.cursor
         except Exception as e:
             logger.error(f"Query failed: {e}")
+            logger.error(f"SQL that failed: {sql[:1000]}")
             raise
     
     def disconnect(self) -> None:
@@ -222,6 +226,8 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
             transaction_started = True
             
             merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr, key_cols_safe=key_cols_safe)
+            logger.info(f"Generated MERGE SQL (first 500 chars): {merge_sql[:500]}")
+            logger.info(f"Staging table: {staging_table}, Production table: {table}")
             fb_connector.execute(merge_sql)
             
             # Get row count if possible
