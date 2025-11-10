@@ -2,7 +2,7 @@
 Lambda: S3 → Firebolt CDC (Direct COPY + MERGE)
 REFACTORED VERSION using Firebolt SDK
 """
-import os, re, json, logging, hashlib, time
+import os, re, json, logging, hashlib, time, random
 import boto3
 from firebolt.db import connect as fb_connect
 from firebolt.client.auth import UsernamePassword, ClientCredentials
@@ -202,6 +202,70 @@ def render_merge(table, staging_table, cols, key_cols, delete_expr=None, key_col
     
     return "\n".join(parts)
 
+def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, delete_expr=None, key_cols_safe=None, max_retries=3):
+    """Execute MERGE with retry logic for transaction conflicts
+    
+    Args:
+        fb_connector: Firebolt connector instance
+        table: Target table name
+        staging_table: Staging table name
+        cols: List of columns to merge
+        keys: Original primary key columns
+        delete_expr: Optional delete expression for CDC
+        key_cols_safe: Filtered primary keys for ON clause
+        max_retries: Maximum number of retry attempts (default 3)
+    """
+    for attempt in range(max_retries):
+        transaction_started = False
+        try:
+            fb_connector.execute("BEGIN;")
+            transaction_started = True
+            
+            merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr, key_cols_safe=key_cols_safe)
+            fb_connector.execute(merge_sql)
+            
+            # Get row count if possible
+            try:
+                rows_affected = fb_connector.cursor.rowcount if hasattr(fb_connector.cursor, 'rowcount') else "unknown"
+            except:
+                rows_affected = "unknown"
+            
+            fb_connector.execute("COMMIT;")
+            transaction_started = False  # Transaction completed
+            logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
+            return  # Success!
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Rollback if transaction is active
+            if transaction_started:
+                try:
+                    fb_connector.execute("ROLLBACK;")
+                    logger.info("✓ Transaction rolled back")
+                except Exception as rollback_error:
+                    logger.warning(f"Failed to rollback transaction: {rollback_error}")
+            
+            # Check if it's a transaction conflict (Firebolt MVCC conflict)
+            if "conflict" in error_msg.lower() or "detected 1 conflicts" in error_msg:
+                if attempt < max_retries - 1:
+                    # Exponential backoff with jitter to avoid thundering herd
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(f"⚠️  Transaction conflict on {table}, retry {attempt + 1}/{max_retries} in {wait_time:.2f}s")
+                    time.sleep(wait_time)
+                    continue  # Retry
+                else:
+                    logger.error(f"✗ MERGE failed for {table} after {max_retries} retries: {e}")
+                    logger.error(f"   Columns used: {cols}")
+                    logger.error(f"   Primary keys: {keys}")
+                    raise
+            else:
+                # Not a conflict error, don't retry (e.g., schema errors, syntax errors)
+                logger.error(f"✗ MERGE failed for {table}: {e}")
+                logger.error(f"   Columns used: {cols}")
+                logger.error(f"   Primary keys: {keys}")
+                raise
+
 def cleanup_staging_table(staging_table, fb_connector):
     """Drop temporary staging table"""
     try:
@@ -359,39 +423,17 @@ def handler(event, context):
             else:
                 logger.warning(f"CDC delete column '{delete_col}' not found in staging table, skipping delete handling")
         
-        # Execute MERGE in transaction
-        transaction_started = False
-        try:
-            fb_connector.execute("BEGIN;")
-            transaction_started = True
-            
-            merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr, key_cols_safe=key_cols_safe)
-            fb_connector.execute(merge_sql)
-            
-            # Get row count if possible (optional, some DBs return this)
-            try:
-                rows_affected = fb_connector.cursor.rowcount if hasattr(fb_connector.cursor, 'rowcount') else "unknown"
-            except:
-                rows_affected = "unknown"
-            
-            fb_connector.execute("COMMIT;")
-            transaction_started = False  # Transaction completed
-            logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
-            
-        except Exception as e:
-            # Only rollback if transaction was actually started
-            if transaction_started:
-                try:
-                    fb_connector.execute("ROLLBACK;")
-                    logger.info("✓ Transaction rolled back")
-                except Exception as rollback_error:
-                    logger.warning(f"Failed to rollback transaction: {rollback_error}")
-                    # Don't raise - the original error is more important
-            
-            logger.error(f"✗ MERGE failed for {table}: {e}")
-            logger.error(f"   Columns used: {cols}")
-            logger.error(f"   Primary keys: {keys}")
-            raise
+        # Execute MERGE with retry logic for transaction conflicts
+        execute_merge_with_retry(
+            fb_connector=fb_connector,
+            table=table,
+            staging_table=staging_table,
+            cols=cols,
+            keys=keys,
+            delete_expr=delete_expr,
+            key_cols_safe=key_cols_safe,
+            max_retries=3
+        )
         
         # Cleanup staging table
         cleanup_staging_table(staging_table, fb_connector)
