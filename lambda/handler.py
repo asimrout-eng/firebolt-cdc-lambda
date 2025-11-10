@@ -230,10 +230,22 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
             except:
                 rows_affected = "unknown"
             
-            fb_connector.execute("COMMIT;")
-            transaction_started = False  # Transaction completed
-            logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
-            return  # Success!
+            # COMMIT might fail if transaction was auto-rolled back by Firebolt
+            try:
+                fb_connector.execute("COMMIT;")
+                transaction_started = False  # Transaction completed
+                logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
+                return  # Success!
+            except Exception as commit_error:
+                commit_msg = str(commit_error)
+                if "no transaction is in progress" in commit_msg.lower():
+                    # Transaction was auto-rolled back by Firebolt (timeout/conflict)
+                    transaction_started = False
+                    logger.warning(f"⚠️  Transaction was auto-rolled back by Firebolt for {table}: {commit_error}")
+                    # Treat as conflict and retry
+                    raise Exception(f"Transaction conflict: auto-rolled back by Firebolt")
+                else:
+                    raise
             
         except Exception as e:
             error_msg = str(e)
