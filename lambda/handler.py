@@ -272,8 +272,11 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
                 except Exception as rollback_error:
                     logger.warning(f"Failed to rollback transaction: {rollback_error}")
             
-            # Check if it's a transaction conflict (Firebolt MVCC conflict)
-            if "conflict" in error_msg.lower() or "detected 1 conflicts" in error_msg:
+            # Check if it's a transaction conflict (Firebolt MVCC conflict) or timeout
+            # Also retry when Firebolt's internal retry limit is reached ("cannot be retried")
+            if ("conflict" in error_msg.lower() or 
+                "detected 1 conflicts" in error_msg or 
+                "cannot be retried" in error_msg.lower()):
                 if attempt < max_retries - 1:
                     # Exponential backoff with jitter to avoid thundering herd
                     wait_time = (2 ** attempt) + random.uniform(0, 1)
