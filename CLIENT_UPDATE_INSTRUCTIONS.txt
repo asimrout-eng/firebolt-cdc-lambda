@@ -1,0 +1,131 @@
+═══════════════════════════════════════════════════════════════════
+  URGENT: Lambda Transaction Conflict Fix
+═══════════════════════════════════════════════════════════════════
+
+📋 WHAT WAS FIXED:
+  ✅ Transaction conflict retry logic (auto-retry up to 3 times)
+  ✅ "Cannot ROLLBACK transaction" error prevention
+  ✅ Exponential backoff to avoid conflicts
+
+═══════════════════════════════════════════════════════════════════
+  📥 STEP-BY-STEP UPDATE INSTRUCTIONS
+═══════════════════════════════════════════════════════════════════
+
+1️⃣  Navigate to project directory:
+   cd ~/firebolt-cdc-lambda
+
+2️⃣  Run the update script:
+   ./UPDATE_LAMBDA_FIX.sh
+
+   (If permission denied, run: chmod +x UPDATE_LAMBDA_FIX.sh)
+
+3️⃣  The script will:
+   - Pull latest code from GitHub
+   - Ask if you want to limit Lambda concurrency (RECOMMENDED: Yes)
+   - Deploy updated Lambda function
+
+4️⃣  Wait for deployment (3-5 minutes)
+
+5️⃣  Monitor logs to verify fix:
+   aws logs tail /aws/lambda/firebolt-cdc-processor --follow --region ap-south-1
+
+═══════════════════════════════════════════════════════════════════
+  ✅ EXPECTED RESULTS (After Fix)
+═══════════════════════════════════════════════════════════════════
+
+You should see in logs:
+
+✅ GOOD MESSAGES (Success):
+   ✓ MERGE completed for cent_user (123 rows affected)
+   ✓ Transaction rolled back
+
+⚠️  RETRY MESSAGES (Normal - system auto-retrying):
+   ⚠️  Transaction conflict on cent_user, retry 1/3 in 1.25s
+   ⚠️  Transaction conflict on cent_user, retry 2/3 in 2.47s
+
+❌ ERRORS THAT SHOULD STOP:
+   ✗ Cannot ROLLBACK transaction: no transaction is in progress
+
+═══════════════════════════════════════════════════════════════════
+  🎯 QUICK COPY-PASTE COMMANDS
+═══════════════════════════════════════════════════════════════════
+
+# Update Lambda (run all these commands):
+cd ~/firebolt-cdc-lambda
+git pull origin main
+./UPDATE_LAMBDA_FIX.sh
+
+# Monitor logs:
+aws logs tail /aws/lambda/firebolt-cdc-processor --follow --region ap-south-1
+
+# Check Lambda concurrency setting:
+aws lambda get-function-concurrency \
+  --function-name firebolt-cdc-processor \
+  --region ap-south-1
+
+# If you need to adjust concurrency later:
+# Set to 5 (recommended):
+aws lambda put-function-concurrency \
+  --function-name firebolt-cdc-processor \
+  --reserved-concurrent-executions 5 \
+  --region ap-south-1
+
+# Or set to 10 (if processing too slow):
+aws lambda put-function-concurrency \
+  --function-name firebolt-cdc-processor \
+  --reserved-concurrent-executions 10 \
+  --region ap-south-1
+
+═══════════════════════════════════════════════════════════════════
+  📊 WHY THIS FIX IS NEEDED
+═══════════════════════════════════════════════════════════════════
+
+PROBLEM:
+  - DMS writes 100+ files to S3 simultaneously
+  - Lambda triggers 100+ concurrent executions
+  - Multiple Lambdas try to MERGE into same table
+  - Firebolt allows only 1 transaction per table at a time
+  - Others fail with "conflict" error
+
+SOLUTION:
+  - Retry logic: Automatically retry failed MERGEs up to 3 times
+  - Exponential backoff: Wait longer between retries (1s, 2s, 4s)
+  - Concurrency limit: Reduce from unlimited to 5-10 concurrent
+
+═══════════════════════════════════════════════════════════════════
+  🆘 TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════
+
+❌ "git pull" shows conflicts:
+   git reset --hard origin/main
+   git pull origin main
+
+❌ "Permission denied" on script:
+   chmod +x UPDATE_LAMBDA_FIX.sh
+   ./UPDATE_LAMBDA_FIX.sh
+
+❌ Still seeing transaction conflicts after fix:
+   Reduce concurrency to 3:
+   aws lambda put-function-concurrency \
+     --function-name firebolt-cdc-processor \
+     --reserved-concurrent-executions 3 \
+     --region ap-south-1
+
+❌ Processing too slow:
+   Increase concurrency to 10:
+   aws lambda put-function-concurrency \
+     --function-name firebolt-cdc-processor \
+     --reserved-concurrent-executions 10 \
+     --region ap-south-1
+
+═══════════════════════════════════════════════════════════════════
+  📞 SUPPORT
+═══════════════════════════════════════════════════════════════════
+
+If issues persist after running this update, share:
+1. Output of: aws logs tail /aws/lambda/firebolt-cdc-processor --region ap-south-1 --since 30m
+2. Screenshot of any error messages
+3. Lambda concurrency setting (from get-function-concurrency command above)
+
+═══════════════════════════════════════════════════════════════════
+
