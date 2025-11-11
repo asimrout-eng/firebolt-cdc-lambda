@@ -84,6 +84,7 @@ class FireboltConnector:
                 engine_name=_clean(os.environ['FIREBOLT_ENGINE']),
                 database=_clean(os.environ['FIREBOLT_DATABASE']),
                 disable_cache=True
+                # Using default autocommit=True - each statement is atomic
             )
             self.cursor = self.connection.cursor()
             logger.info("✓ Successfully connected to Firebolt")
@@ -215,7 +216,10 @@ def render_merge(table, staging_table, cols, key_cols, delete_expr=None, key_col
     return "\n".join(parts)
 
 def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, delete_expr=None, key_cols_safe=None, max_retries=3):
-    """Execute MERGE with retry logic for transaction conflicts
+    """Execute MERGE with retry logic for Firebolt MVCC conflicts
+    
+    Single MERGE statement is atomic - no explicit transaction wrapper needed.
+    With autocommit=True (default), the MERGE auto-commits on success.
     
     Args:
         fb_connector: Firebolt connector instance
@@ -228,14 +232,12 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
         max_retries: Maximum number of retry attempts (default 3)
     """
     for attempt in range(max_retries):
-        transaction_started = False
         try:
-            fb_connector.execute("BEGIN;")
-            transaction_started = True
-            
             merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr, key_cols_safe=key_cols_safe)
             logger.info(f"Generated MERGE SQL (first 500 chars): {merge_sql[:500]}")
             logger.info(f"Staging table: {staging_table}, Production table: {table}")
+            
+            # Execute MERGE (auto-commits on success with autocommit=True)
             fb_connector.execute(merge_sql)
             
             # Get row count if possible
@@ -244,67 +246,33 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
             except:
                 rows_affected = "unknown"
             
-            # COMMIT might fail if transaction was auto-rolled back by Firebolt
-            try:
-                fb_connector.execute("COMMIT;")
-                transaction_started = False  # Transaction completed
-                logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
-                return  # Success!
-            except Exception as commit_error:
-                commit_msg = str(commit_error)
-                if "no transaction is in progress" in commit_msg.lower():
-                    # Transaction was auto-rolled back by Firebolt (timeout/conflict)
-                    logger.warning(f"⚠️  Transaction was auto-rolled back by Firebolt for {table}: {commit_error}")
-                    
-                    # Only send ROLLBACK if error contains "Cannot" (uppercase C)
-                    # "cannot COMMIT" (lowercase c) means transaction is already fully cleared
-                    if "Cannot" in commit_msg:
-                        # Per Firebolt docs: "You must explicitly send a ROLLBACK command to end the aborted transaction"
-                        # https://docs.firebolt.io/reference-sql/explicit-transactions
-                        try:
-                            fb_connector.execute("ROLLBACK;")
-                            logger.info("✓ Sent ROLLBACK to clear aborted transaction state")
-                        except Exception as rollback_error:
-                            logger.warning(f"Failed to ROLLBACK aborted transaction: {rollback_error}")
-                    else:
-                        logger.info("✓ Transaction already cleared by Firebolt (no ROLLBACK needed)")
-                    
-                    transaction_started = False  # Clear flag
-                    # Treat as conflict and retry
-                    raise Exception(f"Transaction conflict: auto-rolled back by Firebolt")
-                else:
-                    raise
+            logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
+            return  # Success!
             
         except Exception as e:
             error_msg = str(e)
             
-            # Rollback if transaction is active
-            if transaction_started:
-                try:
-                    fb_connector.execute("ROLLBACK;")
-                    logger.info("✓ Transaction rolled back")
-                except Exception as rollback_error:
-                    logger.warning(f"Failed to rollback transaction: {rollback_error}")
-            
-            # Check if it's a transaction conflict (Firebolt MVCC conflict) or timeout
-            # Also retry when Firebolt's internal retry limit is reached ("cannot be retried")
+            # Check if it's a retryable Firebolt MVCC conflict or timeout
+            # Firebolt detects conflicts internally and reports them as exceptions
             if ("conflict" in error_msg.lower() or 
                 "detected 1 conflicts" in error_msg or 
                 "cannot be retried" in error_msg.lower()):
+                
                 if attempt < max_retries - 1:
                     # Exponential backoff with jitter to avoid thundering herd
                     wait_time = (2 ** attempt) + random.uniform(0, 1)
-                    logger.warning(f"⚠️  Transaction conflict on {table}, retry {attempt + 1}/{max_retries} in {wait_time:.2f}s")
+                    logger.warning(f"⚠️  MVCC conflict on {table}, retry {attempt + 1}/{max_retries} in {wait_time:.2f}s: {error_msg}")
                     time.sleep(wait_time)
                     continue  # Retry
                 else:
-                    logger.error(f"✗ MERGE failed for {table} after {max_retries} retries: {e}")
+                    # Max retries reached
+                    logger.error(f"✗ MERGE failed for {table} after {max_retries} retries: {error_msg}")
                     logger.error(f"   Columns used: {cols}")
                     logger.error(f"   Primary keys: {keys}")
                     raise
             else:
-                # Not a conflict error, don't retry (e.g., schema errors, syntax errors)
-                logger.error(f"✗ MERGE failed for {table}: {e}")
+                # Non-retryable error (e.g., schema errors, syntax errors)
+                logger.error(f"✗ MERGE failed for {table} with non-retryable error: {error_msg}")
                 logger.error(f"   Columns used: {cols}")
                 logger.error(f"   Primary keys: {keys}")
                 raise
