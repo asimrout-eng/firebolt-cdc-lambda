@@ -7,9 +7,17 @@ import boto3
 from firebolt.db import connect as fb_connect
 from firebolt.client.auth import UsernamePassword, ClientCredentials
 from typing import Optional, Any
+import firebolt
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Log SDK version on Lambda cold start
+try:
+    SDK_VERSION = getattr(firebolt, '__version__', 'unknown')
+    logger.info(f"🔧 Firebolt Python SDK Version: {SDK_VERSION}")
+except Exception as e:
+    logger.warning(f"Could not determine Firebolt SDK version: {e}")
 
 class FireboltConnector:
     """Handles Firebolt database connections and operations"""
