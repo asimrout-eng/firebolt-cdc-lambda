@@ -10,14 +10,15 @@ SOLUTION: Run these commands (copy-paste)
   STEP 1: Get Latest from GitHub
 ═══════════════════════════════════════════════════════════════════
 
-cd firebolt-cdk-package
+# Navigate to your cloned repo folder (wherever you cloned it)
+cd <your-repo-folder>  # e.g., cd firebolt-cdc-lambda
 git pull origin main
 
 ═══════════════════════════════════════════════════════════════════
   STEP 2: Force Lambda Update (Option 2 - Recommended)
 ═══════════════════════════════════════════════════════════════════
 
-cd firebolt-cdk-package
+# Make sure you're in the repo folder
 
 # Create deployment package
 mkdir -p lambda-package

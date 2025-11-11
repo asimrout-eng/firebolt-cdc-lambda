@@ -17,7 +17,8 @@ This means **new Lambda code was NOT deployed**. You're still running old code w
 ### **Step 1: Verify You Have Latest Code**
 
 ```bash
-cd firebolt-cdk-package
+# Navigate to your cloned repo folder
+cd <your-repo-folder>  # e.g., cd firebolt-cdc-lambda
 
 # Check git commit
 git log --oneline -1
@@ -36,7 +37,7 @@ grep -n 'if "Cannot" in commit_msg:' lambda/handler.py
 ### **Step 2: Clean CDK Cache**
 
 ```bash
-cd firebolt-cdk-package
+# Make sure you're in the repo folder
 
 # Remove CDK cache
 rm -rf cdk.out lambda-layer
@@ -49,7 +50,7 @@ echo "✓ Cache cleaned"
 ### **Step 3: Force Redeploy**
 
 ```bash
-cd firebolt-cdk-package
+# Make sure you're in the repo folder
 
 # Run deployment script
 ./scripts/deploy.sh
@@ -75,7 +76,7 @@ FireboltCdcStack.LambdaFunctionName = firebolt-cdc-processor
 ### **Step 4: Manual Lambda Update (If CDK Fails)**
 
 ```bash
-cd firebolt-cdk-package
+# Make sure you're in the repo folder
 
 # Create deployment package
 rm -rf lambda-package lambda-code.zip

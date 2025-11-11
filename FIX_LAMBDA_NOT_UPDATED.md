@@ -16,7 +16,8 @@ cannot COMMIT transaction: no transaction is in progress
 ### **Option 1: Force CDK Redeploy**
 
 ```bash
-cd firebolt-cdk-package
+# Navigate to your cloned repo folder
+cd <your-repo-folder>  # e.g., cd firebolt-cdc-lambda
 
 # Clean cache
 rm -rf cdk.out lambda-layer
@@ -34,7 +35,8 @@ rm -rf cdk.out lambda-layer
 ### **Option 2: Manual Lambda Update (Recommended)**
 
 ```bash
-cd firebolt-cdk-package
+# Navigate to your cloned repo folder
+cd <your-repo-folder>  # e.g., cd firebolt-cdc-lambda
 
 # Create deployment package
 mkdir -p lambda-package
