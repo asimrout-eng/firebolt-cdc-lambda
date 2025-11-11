@@ -216,10 +216,16 @@ def render_merge(table, staging_table, cols, key_cols, delete_expr=None, key_col
     return "\n".join(parts)
 
 def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, delete_expr=None, key_cols_safe=None, max_retries=3):
-    """Execute MERGE with retry logic for Firebolt MVCC conflicts
+    """Execute MERGE with retry logic using Firebolt HTTP status codes
     
     Single MERGE statement is atomic - no explicit transaction wrapper needed.
     With autocommit=True (default), the MERGE auto-commits on success.
+    
+    Error handling follows Firebolt best practices:
+    - 409 Conflict: Transaction conflict → Retry with backoff
+    - 5xx Server Error: Transient failure → Retry with backoff
+    - 4xx Client Error: Permanent error → Don't retry, fail immediately
+    - 2xx Success: Proceed
     
     Args:
         fb_connector: Firebolt connector instance
@@ -247,32 +253,78 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
                 rows_affected = "unknown"
             
             logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
-            return  # Success!
+            return  # Success (2xx)!
             
         except Exception as e:
             error_msg = str(e)
             
-            # Check if it's a retryable Firebolt MVCC conflict or timeout
-            # Firebolt detects conflicts internally and reports them as exceptions
-            if ("conflict" in error_msg.lower() or 
-                "detected 1 conflicts" in error_msg or 
-                "cannot be retried" in error_msg.lower()):
-                
+            # Extract HTTP status code from exception (Firebolt SDK best practice)
+            status_code = None
+            if hasattr(e, 'status_code'):
+                status_code = e.status_code
+            elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                status_code = e.response.status_code
+            
+            # Determine if error is retryable based on HTTP status code
+            is_retryable = False
+            error_category = "Unknown"
+            
+            if status_code:
+                if status_code == 409:
+                    # 409 Conflict: Transaction conflict (retryable)
+                    is_retryable = True
+                    error_category = "Conflict (409)"
+                elif 500 <= status_code < 600:
+                    # 5xx: Server error (retryable)
+                    is_retryable = True
+                    error_category = f"Server Error ({status_code})"
+                elif 400 <= status_code < 500:
+                    # 4xx: Client error (non-retryable, except 409 handled above)
+                    is_retryable = False
+                    error_category = f"Client Error ({status_code})"
+                else:
+                    # 2xx or other: Success or unexpected
+                    is_retryable = False
+                    error_category = f"Unexpected ({status_code})"
+            else:
+                # Fallback: No status code available, check error message
+                # (backwards compatibility for older SDK versions or network errors)
+                logger.warning(f"⚠️  No HTTP status code available, falling back to text matching")
+                if ("conflict" in error_msg.lower() or 
+                    "detected 1 conflicts" in error_msg or
+                    "cannot be retried" in error_msg.lower()):
+                    is_retryable = True
+                    error_category = "Conflict (text match)"
+                else:
+                    is_retryable = False
+                    error_category = "Non-retryable (text match)"
+            
+            # Handle based on retryability
+            if is_retryable:
                 if attempt < max_retries - 1:
                     # Exponential backoff with jitter to avoid thundering herd
                     wait_time = (2 ** attempt) + random.uniform(0, 1)
-                    logger.warning(f"⚠️  MVCC conflict on {table}, retry {attempt + 1}/{max_retries} in {wait_time:.2f}s: {error_msg}")
+                    logger.warning(
+                        f"⚠️  {error_category} on {table}, "
+                        f"retry {attempt + 1}/{max_retries} in {wait_time:.2f}s: {error_msg}"
+                    )
                     time.sleep(wait_time)
                     continue  # Retry
                 else:
                     # Max retries reached
-                    logger.error(f"✗ MERGE failed for {table} after {max_retries} retries: {error_msg}")
+                    logger.error(
+                        f"✗ MERGE failed for {table} after {max_retries} retries "
+                        f"({error_category}): {error_msg}"
+                    )
                     logger.error(f"   Columns used: {cols}")
                     logger.error(f"   Primary keys: {keys}")
                     raise
             else:
-                # Non-retryable error (e.g., schema errors, syntax errors)
-                logger.error(f"✗ MERGE failed for {table} with non-retryable error: {error_msg}")
+                # Non-retryable error (permanent client error or syntax issue)
+                logger.error(
+                    f"✗ MERGE failed for {table} with non-retryable error "
+                    f"({error_category}): {error_msg}"
+                )
                 logger.error(f"   Columns used: {cols}")
                 logger.error(f"   Primary keys: {keys}")
                 raise
@@ -382,18 +434,53 @@ def handler(event, context):
         col_types_production = get_column_types("public", table, fb_connector)
         
         # Use intersection of columns (only columns present in both tables)
-        cols = [c for c in cols_production if c in cols_staging]
+        cols_initial = [c for c in cols_production if c in cols_staging]
         
-        if not cols:
+        if not cols_initial:
             raise RuntimeError(f"No common columns between staging and production table '{table}'")
         
-        # Verify primary keys are in the common column list
+        # Filter out DECIMAL/NUMERIC columns with mismatched precision from ALL columns
+        # (Firebolt won't allow assignment between different DECIMAL precisions)
+        cols = []
+        decimal_cols_removed = []
+        for c in cols_initial:
+            prod_type = col_types_production.get(c, "")
+            stg_type = col_types_staging.get(c, "")
+            
+            # Check if column is DECIMAL/NUMERIC with different precision
+            if ("DECIMAL" in prod_type.upper() or "NUMERIC" in prod_type.upper()):
+                if prod_type != stg_type:
+                    decimal_cols_removed.append(f"{c} (prod: {prod_type}, stg: {stg_type})")
+                    logger.warning(f"⚠️  Skipping DECIMAL column '{c}' from MERGE due to type mismatch: prod={prod_type}, stg={stg_type}")
+                    continue
+            
+            cols.append(c)
+        
+        if not cols:
+            raise RuntimeError(f"No compatible columns after filtering DECIMALs for table '{table}'")
+        
+        if decimal_cols_removed:
+            logger.warning(f"⚠️  {len(decimal_cols_removed)} DECIMAL columns removed from MERGE: {decimal_cols_removed}")
+        
+        # Verify primary keys are in the filtered column list
         missing_keys = [k for k in keys if k not in cols]
         if missing_keys:
-            raise RuntimeError(
-                f"Primary keys {missing_keys} not found in common columns for table '{table}'. "
-                f"Production columns: {cols_production}, Staging columns: {cols_staging}"
-            )
+            # Check if missing keys were filtered due to DECIMAL mismatch
+            decimal_key_issues = [d for d in decimal_cols_removed if any(k in d for k in missing_keys)]
+            if decimal_key_issues:
+                error_msg = (
+                    f"⚠️  Cannot process table '{table}': Primary key(s) {missing_keys} have DECIMAL precision mismatch. "
+                    f"This file will be skipped. Schema fix required:\n"
+                    f"  Mismatched keys: {decimal_key_issues}\n"
+                    f"  Solution: Run schema fix SQL to recreate table with correct data types."
+                )
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+            else:
+                raise RuntimeError(
+                    f"Primary keys {missing_keys} not found in compatible columns for table '{table}'. "
+                    f"Production columns: {cols_production}, Staging columns: {cols_staging}, Filtered: {cols}"
+                )
         
         # Filter out DECIMAL columns from primary keys for ON clause
         # (Firebolt can't compare DECIMALs with different precision/scale)
