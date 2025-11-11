@@ -1,0 +1,82 @@
+═══════════════════════════════════════════════════════════════════
+  QUICK REFERENCE: Selective Table Reload
+═══════════════════════════════════════════════════════════════════
+
+✅ YES - You can reload specific tables only (don't need to reload all)
+
+───────────────────────────────────────────────────────────────────
+
+📌 OPTION 1: Reload Multiple Specific Tables
+
+  # Edit the script first to specify tables:
+  nano retrigger_lambda_selective.py
+  
+  # Change this line:
+  TABLES_TO_RELOAD = [
+      'cent_user',
+      'sessions',
+      'cent_emi',
+  ]
+  
+  # Then run:
+  python3 retrigger_lambda_selective.py
+
+  # OR pass tables as arguments:
+  python3 retrigger_lambda_selective.py cent_user sessions cent_emi
+
+───────────────────────────────────────────────────────────────────
+
+📌 OPTION 2: Reload Single Table
+
+  ./retrigger_single_table.sh cent_user
+
+  # Examples:
+  ./retrigger_single_table.sh sessions
+  ./retrigger_single_table.sh cent_emi
+  ./retrigger_single_table.sh users
+
+───────────────────────────────────────────────────────────────────
+
+📌 OPTION 3: Reload ALL Tables (Original Script)
+
+  python3 retrigger_lambda_for_old_files.py
+
+───────────────────────────────────────────────────────────────────
+
+📊 COMPARISON:
+
+Method                         Tables      Time (estimate)
+────────────────────────────────────────────────────────────────
+Reload ALL (809 tables)        ALL         ~15 minutes
+Reload 9 tables (selective)    9 only      ~2 minutes
+Reload 1 table (single)        1 only      ~30 seconds
+
+───────────────────────────────────────────────────────────────────
+
+🎯 COMMON USE CASES:
+
+After fixing DECIMAL errors for 9 tables:
+  python3 retrigger_lambda_selective.py \
+    cent_borrower_transaction \
+    cent_communications_log \
+    cent_ekyc_verification_logs \
+    cent_emi \
+    cent_emi_err_log \
+    cent_inv_escrow_upi_transaction \
+    cent_pre_borrower_transaction \
+    cent_user_thirdparty_ekyc_details \
+    payment_source
+
+After fixing schema for high-contention tables:
+  ./retrigger_single_table.sh users
+  ./retrigger_single_table.sh sessions
+
+Test Lambda fix on 1 table first:
+  ./retrigger_single_table.sh cent_sms_status
+
+───────────────────────────────────────────────────────────────────
+
+📖 Full Guide: See SELECTIVE_RELOAD_GUIDE.md
+
+═══════════════════════════════════════════════════════════════════
+
