@@ -246,16 +246,22 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
                 commit_msg = str(commit_error)
                 if "no transaction is in progress" in commit_msg.lower():
                     # Transaction was auto-rolled back by Firebolt (timeout/conflict)
-                    # Per Firebolt docs: "You must explicitly send a ROLLBACK command to end the aborted transaction"
-                    # https://docs.firebolt.io/reference-sql/explicit-transactions
                     logger.warning(f"⚠️  Transaction was auto-rolled back by Firebolt for {table}: {commit_error}")
-                    try:
-                        fb_connector.execute("ROLLBACK;")
-                        logger.info("✓ Sent ROLLBACK to clear aborted transaction state")
-                    except Exception as rollback_error:
-                        logger.warning(f"Failed to ROLLBACK aborted transaction: {rollback_error}")
                     
-                    transaction_started = False  # Clear flag after ROLLBACK
+                    # Only send ROLLBACK if error contains "Cannot" (uppercase C)
+                    # "cannot COMMIT" (lowercase c) means transaction is already fully cleared
+                    if "Cannot" in commit_msg:
+                        # Per Firebolt docs: "You must explicitly send a ROLLBACK command to end the aborted transaction"
+                        # https://docs.firebolt.io/reference-sql/explicit-transactions
+                        try:
+                            fb_connector.execute("ROLLBACK;")
+                            logger.info("✓ Sent ROLLBACK to clear aborted transaction state")
+                        except Exception as rollback_error:
+                            logger.warning(f"Failed to ROLLBACK aborted transaction: {rollback_error}")
+                    else:
+                        logger.info("✓ Transaction already cleared by Firebolt (no ROLLBACK needed)")
+                    
+                    transaction_started = False  # Clear flag
                     # Treat as conflict and retry
                     raise Exception(f"Transaction conflict: auto-rolled back by Firebolt")
                 else:
