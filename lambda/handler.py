@@ -287,14 +287,24 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
                     is_retryable = False
                     error_category = f"Unexpected ({status_code})"
             else:
-                # Fallback: No status code available, check error message
+                # Fallback: No status code available, check error message and error code
                 # (backwards compatibility for older SDK versions or network errors)
-                logger.warning(f"⚠️  No HTTP status code available, falling back to text matching")
-                if ("conflict" in error_msg.lower() or 
-                    "detected 1 conflicts" in error_msg or
-                    "cannot be retried" in error_msg.lower()):
+                logger.warning(f"⚠️  No HTTP status code available, falling back to text/code matching")
+                
+                # Check for Firebolt error code 9 (transaction conflict)
+                has_conflict_code = "code: 9" in error_msg or "code:9" in error_msg
+                
+                # Check for conflict keywords in error message
+                has_conflict_text = ("conflict" in error_msg.lower() or 
+                                   "detected" in error_msg.lower() and "conflicts" in error_msg.lower() or
+                                   "cannot be retried" in error_msg.lower())
+                
+                if has_conflict_code or has_conflict_text:
                     is_retryable = True
-                    error_category = "Conflict (text match)"
+                    if has_conflict_code:
+                        error_category = "Conflict (error code 9)"
+                    else:
+                        error_category = "Conflict (text match)"
                 else:
                     is_retryable = False
                     error_category = "Non-retryable (text match)"
@@ -303,7 +313,9 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
             if is_retryable:
                 if attempt < max_retries - 1:
                     # Exponential backoff with jitter to avoid thundering herd
-                    wait_time = (2 ** attempt) + random.uniform(0, 1)
+                    # Increased backoff for MVCC conflicts: 3^attempt instead of 2^attempt
+                    base_wait = (3 ** attempt) if attempt <= 5 else 243  # Cap at ~4 minutes
+                    wait_time = base_wait + random.uniform(0, 2)
                     logger.warning(
                         f"⚠️  {error_category} on {table}, "
                         f"retry {attempt + 1}/{max_retries} in {wait_time:.2f}s: {error_msg}"
@@ -522,6 +534,7 @@ def handler(event, context):
                 logger.warning(f"CDC delete column '{delete_col}' not found in staging table, skipping delete handling")
         
         # Execute MERGE with retry logic for transaction conflicts
+        # Increased retries to handle high-contention tables
         execute_merge_with_retry(
             fb_connector=fb_connector,
             table=table,
@@ -530,7 +543,7 @@ def handler(event, context):
             keys=keys,
             delete_expr=delete_expr,
             key_cols_safe=key_cols_safe,
-            max_retries=3
+            max_retries=10  # Increased from 3 to handle MVCC conflicts
         )
         
         # Cleanup staging table
