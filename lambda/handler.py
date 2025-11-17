@@ -93,8 +93,16 @@ class FireboltConnector:
             logger.error(f"Failed to connect to Firebolt: {str(e)}")
             raise
     
-    def execute(self, sql: str) -> Any:
-        """Execute SQL and return results (raw SQL, no prepared statements)"""
+    def execute(self, sql: str, retry_on_connection_error=True) -> Any:
+        """Execute SQL and return results (raw SQL, no prepared statements)
+        
+        Args:
+            sql: SQL query to execute
+            retry_on_connection_error: If True, reconnect and retry once on connection errors
+        
+        Returns:
+            Cursor with query results
+        """
         logger.info("SQL>> %s", sql[:200] + "..." if len(sql) > 200 else sql)
         try:
             # Force raw SQL execution (no prepared statements)
@@ -103,9 +111,38 @@ class FireboltConnector:
             self.cursor.execute(str(sql))
             return self.cursor
         except Exception as e:
-            logger.error(f"Query failed: {e}")
-            logger.error(f"SQL that failed: {sql[:1000]}")
-            raise
+            error_msg = str(e)
+            
+            # Check for connection/engine errors that indicate stale connection
+            connection_errors = [
+                "connection",
+                "engine",
+                "session",
+                "cannot be retried",  # Firebolt's "Query of type 'DML Merge' cannot be retried"
+                "timeout",
+                "closed"
+            ]
+            
+            is_connection_error = any(keyword in error_msg.lower() for keyword in connection_errors)
+            
+            if is_connection_error and retry_on_connection_error:
+                logger.warning(f"⚠️  Connection error detected, attempting to reconnect: {error_msg}")
+                try:
+                    # Reconnect
+                    self.disconnect()
+                    self.connect()
+                    logger.info("✓ Reconnected successfully, retrying query")
+                    
+                    # Retry query (only once, to avoid infinite loop)
+                    self.cursor.execute(str(sql))
+                    return self.cursor
+                except Exception as retry_error:
+                    logger.error(f"✗ Retry after reconnect failed: {retry_error}")
+                    raise
+            else:
+                logger.error(f"Query failed: {e}")
+                logger.error(f"SQL that failed: {sql[:1000]}")
+                raise
     
     def disconnect(self) -> None:
         """Close Firebolt connection"""
@@ -341,14 +378,57 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
                 logger.error(f"   Primary keys: {keys}")
                 raise
 
-def cleanup_staging_table(staging_table, fb_connector):
-    """Drop temporary staging table"""
-    try:
-        drop_sql = f'DROP TABLE IF EXISTS "public"."{staging_table}"'
-        fb_connector.execute(drop_sql)
-        logger.info(f"✓ Cleaned up staging table {staging_table}")
-    except Exception as e:
-        logger.warning(f"Failed to cleanup staging table: {e}")
+def cleanup_staging_table(staging_table, fb_connector, max_retries=3):
+    """Drop temporary staging table with retry logic
+    
+    Args:
+        staging_table: Name of staging table to drop
+        fb_connector: Firebolt connector instance
+        max_retries: Maximum number of retry attempts (default 3)
+    
+    Returns:
+        bool: True if cleanup succeeded, False otherwise
+    """
+    if not staging_table:
+        return True
+    
+    for attempt in range(max_retries):
+        try:
+            drop_sql = f'DROP TABLE IF EXISTS "public"."{staging_table}"'
+            fb_connector.execute(drop_sql)
+            logger.info(f"✓ Cleaned up staging table {staging_table}")
+            return True
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Check if table doesn't exist (already cleaned up)
+            if "does not exist" in error_msg.lower() or "not found" in error_msg.lower():
+                logger.info(f"✓ Staging table {staging_table} already dropped")
+                return True
+            
+            # Check if connection is closed
+            if "connection" in error_msg.lower() and "closed" in error_msg.lower():
+                logger.error(f"✗ Cannot drop {staging_table}: connection closed")
+                return False
+            
+            # Retry on transient errors
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(
+                    f"⚠️  Failed to drop {staging_table} (attempt {attempt + 1}/{max_retries}), "
+                    f"retrying in {wait_time:.2f}s: {error_msg}"
+                )
+                time.sleep(wait_time)
+            else:
+                # Final attempt failed - log but don't raise
+                # (we don't want cleanup failure to mask the original error)
+                logger.error(
+                    f"✗ Failed to drop {staging_table} after {max_retries} attempts: {error_msg}. "
+                    f"Table will remain in database and should be cleaned up manually or by scheduled job."
+                )
+                return False
+    
+    return False
 
 # Regex to extract database, table, date, filename from S3 key
 # DMS format: firebolt_dms_job/<database>/<table>/YYYY/MM/DD/<filename>.parquet
