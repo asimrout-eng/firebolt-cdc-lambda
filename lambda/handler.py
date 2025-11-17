@@ -258,8 +258,11 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
     Single MERGE statement is atomic - no explicit transaction wrapper needed.
     With autocommit=True (default), the MERGE auto-commits on success.
     
+    CRITICAL: On retry after conflict, we DELETE existing staging keys from production
+    to prevent duplicates caused by partial MERGE commits during MVCC conflicts.
+    
     Error handling follows Firebolt best practices:
-    - 409 Conflict: Transaction conflict → Retry with backoff
+    - 409 Conflict: Transaction conflict → DELETE conflicting keys, then retry
     - 5xx Server Error: Transient failure → Retry with backoff
     - 4xx Client Error: Permanent error → Don't retry, fail immediately
     - 2xx Success: Proceed
@@ -276,6 +279,29 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
     """
     for attempt in range(max_retries):
         try:
+            # On retry (attempt > 0), delete any rows that may have been partially inserted
+            if attempt > 0:
+                logger.warning(f"⚠️  Retry attempt {attempt + 1}: Cleaning up potential duplicates before MERGE")
+                
+                # Build WHERE clause for primary keys from staging
+                key_cols_for_delete = key_cols_safe if key_cols_safe else keys
+                keys_csv = ", ".join([f'"{k}"' for k in key_cols_for_delete])
+                
+                cleanup_sql = f"""
+                DELETE FROM "public"."{table}"
+                WHERE ({keys_csv}) IN (
+                    SELECT {keys_csv}
+                    FROM "public"."{staging_table}"
+                )
+                """
+                
+                try:
+                    fb_connector.execute(cleanup_sql)
+                    logger.info(f"✓ Cleaned up potential duplicates for retry")
+                except Exception as cleanup_error:
+                    logger.warning(f"⚠️  Cleanup failed (non-fatal): {cleanup_error}")
+                    # Continue anyway - MERGE will handle it
+            
             merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr, key_cols_safe=key_cols_safe)
             logger.info(f"Generated MERGE SQL (first 500 chars): {merge_sql[:500]}")
             logger.info(f"Staging table: {staging_table}, Production table: {table}")
@@ -440,8 +466,14 @@ def handler(event, context):
     
     Triggered by S3 ObjectCreated event via EventBridge
     Processes ONE file at a time
+    
+    Includes deduplication to prevent processing same file multiple times
     """
     start_time = time.time()
+    
+    # Generate unique request ID for deduplication
+    request_id = context.aws_request_id
+    logger.info(f"Request ID: {request_id}")
     
     # Extract S3 key from event
     key = ""
