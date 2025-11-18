@@ -1,0 +1,29 @@
+═══════════════════════════════════════════════════════════════════
+  CLIENT: RUN THESE COMMANDS NOW
+═══════════════════════════════════════════════════════════════════
+
+1. PULL LATEST CODE
+   ─────────────────
+   cd <your-repo-folder>
+   git pull origin main
+
+2. DEPLOY LAMBDA
+   ──────────────
+   ./scripts/deploy.sh
+
+3. CLEAN UP STAGING TABLES
+   ────────────────────────
+   cd ..
+   python3 cleanup_staging_tables.py
+
+4. MONITOR (5 minutes)
+   ───────────────────
+   aws logs tail /aws/lambda/firebolt-cdc-processor --follow
+
+═══════════════════════════════════════════════════════════════════
+WHAT WAS FIXED:
+- Staging tables now cleaned up properly (retry logic added)
+- "Query of type DML Merge cannot be retried" fixed (auto-reconnect)
+- NO DATA GAPS (staging tables are ephemeral)
+═══════════════════════════════════════════════════════════════════
+

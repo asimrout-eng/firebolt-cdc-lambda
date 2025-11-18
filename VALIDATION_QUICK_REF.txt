@@ -1,0 +1,139 @@
+═══════════════════════════════════════════════════════════════════
+  🔍 DATA VALIDATION QUICK REFERENCE
+  Redshift ↔ Firebolt
+═══════════════════════════════════════════════════════════════════
+
+🎯 STEP 1: SUMMARY CHECK (1 minute)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Firebolt:
+  SELECT SUM(table_rows) FROM information_schema.tables 
+  WHERE table_schema = 'public';
+
+Redshift:
+  SELECT SUM(n_live_tup) FROM pg_stat_user_tables 
+  WHERE schemaname = 'fair';
+
+COMPARE: If numbers match → ✓ DONE!
+
+═══════════════════════════════════════════════════════════════════
+
+🎯 STEP 2: TABLE-BY-TABLE (5 minutes)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Firebolt:
+  SELECT table_name, table_rows 
+  FROM information_schema.tables 
+  WHERE table_schema = 'public' 
+  ORDER BY table_name;
+
+Redshift:
+  SELECT tablename, n_live_tup 
+  FROM pg_stat_user_tables 
+  WHERE schemaname = 'fair' 
+  ORDER BY tablename;
+
+EXPORT both to CSV → Compare in Excel
+
+═══════════════════════════════════════════════════════════════════
+
+🎯 STEP 3: DETAILED (per table)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Replace 'users' with your table:
+
+  SELECT 
+      COUNT(*) as total,
+      COUNT(DISTINCT id) as unique_ids,
+      MIN(created) as earliest,
+      MAX(created) as latest,
+      SUM(CAST(id AS BIGINT)) as checksum
+  FROM "public"."users";  -- Firebolt
+  
+  SELECT 
+      COUNT(*) as total,
+      COUNT(DISTINCT id) as unique_ids,
+      MIN(created) as earliest,
+      MAX(created) as latest,
+      SUM(CAST(id AS BIGINT)) as checksum
+  FROM fair.users;  -- Redshift
+
+If all 5 values match → ✓ TABLE IS IDENTICAL
+
+═══════════════════════════════════════════════════════════════════
+
+🚨 COMMON ISSUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Issue: Row count mismatch
+Fix: Check for soft deletes
+  SELECT COUNT(*), 
+         SUM(CASE WHEN deleted=1 THEN 1 ELSE 0 END) as deleted
+  FROM "public"."users";
+
+Issue: Data not recent
+Fix: Check latest record
+  SELECT MAX(created), 
+         DATEDIFF('minute', MAX(created), CURRENT_TIMESTAMP) as age
+  FROM "public"."users";
+
+Issue: 10k row limit in Firebolt
+Fix: Use aggregations (GROUP BY date, month, etc.)
+
+═══════════════════════════════════════════════════════════════════
+
+📊 TOP 5 VALIDATION QUERIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Total Row Count:
+   SELECT SUM(table_rows) FROM information_schema.tables 
+   WHERE table_schema = 'public';
+
+2. Table Count:
+   SELECT COUNT(*) FROM information_schema.tables 
+   WHERE table_schema = 'public';
+
+3. Empty Tables:
+   SELECT table_name FROM information_schema.tables 
+   WHERE table_schema = 'public' AND table_rows = 0;
+
+4. Largest Tables:
+   SELECT table_name, table_rows FROM information_schema.tables 
+   WHERE table_schema = 'public' 
+   ORDER BY table_rows DESC LIMIT 10;
+
+5. Data Freshness:
+   SELECT MAX(created) FROM "public"."users";
+
+═══════════════════════════════════════════════════════════════════
+
+🎯 SUCCESS CRITERIA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ Total row counts match (±0.1%)
+✓ All 809 tables exist in both systems
+✓ Checksums match for all tables
+✓ Latest records < 30 minutes old
+✓ No duplicate primary keys
+
+═══════════════════════════════════════════════════════════════════
+
+💻 AUTOMATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run Python script:
+  python3 validate_data_redshift_firebolt.py
+
+Output: validation_report_YYYYMMDD_HHMMSS.csv
+
+═══════════════════════════════════════════════════════════════════
+
+📚 FULL DOCUMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DATA_VALIDATION_QUERIES.sql - 18 SQL queries
+DATA_VALIDATION_GUIDE.md - Complete guide
+validate_data_redshift_firebolt.py - Automation script
+
+═══════════════════════════════════════════════════════════════════
+

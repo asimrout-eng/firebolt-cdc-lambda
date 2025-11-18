@@ -1,0 +1,22 @@
+{
+  "Rules": [
+    {
+      "Id": "ArchiveOldCDCFiles-Minimal",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "firebolt_dms_job/"
+      },
+      "Transitions": [
+        {
+          "Days": 7,
+          "StorageClass": "INTELLIGENT_TIERING"
+        },
+        {
+          "Days": 30,
+          "StorageClass": "DEEP_ARCHIVE"
+        }
+      ]
+    }
+  ]
+}
+

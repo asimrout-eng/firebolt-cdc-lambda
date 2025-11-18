@@ -1,0 +1,148 @@
+═══════════════════════════════════════════════════════════════════
+  📦 S3 LIFECYCLE MANAGEMENT - QUICK GUIDE
+═══════════════════════════════════════════════════════════════════
+
+🎯 GOAL: Automatically archive/delete old CDC files to save costs
+
+📊 CURRENT: ~$150/month for 1TB data
+💰 WITH LIFECYCLE: ~$31/month (80% savings!)
+
+═══════════════════════════════════════════════════════════════════
+  ✅ THREE STRATEGIES
+═══════════════════════════════════════════════════════════════════
+
+Strategy 1: AGGRESSIVE (Recommended)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Timeline:
+  Day 0-7:   S3 Standard (hot)
+  Day 8-30:  Intelligent-Tiering
+  Day 31-90: Glacier Instant Retrieval
+  Day 91+:   DELETE permanently
+
+Cost: ~$31/month (80% savings)
+File: s3_lifecycle_aggressive.json
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Strategy 2: CONSERVATIVE (Extra Safety)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Timeline:
+  Day 0-14:   S3 Standard
+  Day 15-60:  Intelligent-Tiering
+  Day 61-180: Glacier Instant Retrieval
+  Day 181-365: Glacier Flexible (3-5 hour retrieval)
+  Day 366+:   DELETE permanently
+
+Cost: ~$45/month (70% savings)
+File: s3_lifecycle_conservative.json
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Strategy 3: MINIMAL (Keep Forever)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Timeline:
+  Day 0-7:  S3 Standard
+  Day 8-30: Intelligent-Tiering
+  Day 31+:  Deep Archive (12-hour retrieval)
+  Never delete
+
+Cost: ~$10/month (93% savings)
+File: s3_lifecycle_minimal.json
+
+═══════════════════════════════════════════════════════════════════
+  🚀 QUICK IMPLEMENTATION (AWS Console)
+═══════════════════════════════════════════════════════════════════
+
+1. Open AWS Console → S3 → fcanalytics bucket
+
+2. Click "Management" tab → "Create lifecycle rule"
+
+3. Configure:
+   Name: Archive-Old-CDC-Files
+   Prefix: firebolt_dms_job/
+   
+4. Select:
+   ✅ Transition current versions
+   ✅ Expire current versions
+   
+5. Add Transitions:
+   - Day 7 → Intelligent-Tiering
+   - Day 30 → Glacier Instant Retrieval
+   
+6. Expiration:
+   - Day 90 → Delete
+   
+7. Create rule
+
+═══════════════════════════════════════════════════════════════════
+  💻 ALTERNATIVE: AWS CLI
+═══════════════════════════════════════════════════════════════════
+
+# Apply Aggressive strategy
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket fcanalytics \
+  --lifecycle-configuration file://s3_lifecycle_aggressive.json \
+  --region ap-south-1
+
+# Verify
+aws s3api get-bucket-lifecycle-configuration \
+  --bucket fcanalytics \
+  --region ap-south-1
+
+═══════════════════════════════════════════════════════════════════
+  ⚠️  BEFORE ENABLING
+═══════════════════════════════════════════════════════════════════
+
+1. ✅ Verify Lambda success rate (2 weeks)
+   aws logs tail /aws/lambda/firebolt-cdc-processor \
+     --since 14d --region ap-south-1 \
+     | grep "✓ MERGE completed" | wc -l
+
+2. ✅ Check Firebolt data completeness
+   SELECT table_name, COUNT(*) FROM information_schema.tables;
+
+3. ✅ Test retrigger script
+   python3 retrigger_lambda_for_old_files.py --dry-run
+
+═══════════════════════════════════════════════════════════════════
+  🎯 RECOMMENDED ROLLOUT
+═══════════════════════════════════════════════════════════════════
+
+Week 1-2: Monitor Lambda success rate
+Week 3:   Enable CONSERVATIVE strategy
+Week 5:   Switch to AGGRESSIVE (if no issues)
+
+═══════════════════════════════════════════════════════════════════
+  🚨 DISABLE IF NEEDED
+═══════════════════════════════════════════════════════════════════
+
+AWS Console:
+  S3 → fcanalytics → Management → Select rule → Edit
+  Change Status to "Disabled" → Save
+
+AWS CLI:
+  aws s3api delete-bucket-lifecycle \
+    --bucket fcanalytics \
+    --region ap-south-1
+
+═══════════════════════════════════════════════════════════════════
+  📊 COST COMPARISON (Annual, 1TB/month)
+═══════════════════════════════════════════════════════════════════
+
+No Lifecycle:  $1,800/year
+Aggressive:    $372/year   (Save $1,428)
+Conservative:  $540/year   (Save $1,260)
+Minimal:       $120/year   (Save $1,680)
+
+═══════════════════════════════════════════════════════════════════
+  📚 DOCUMENTATION
+═══════════════════════════════════════════════════════════════════
+
+Complete Guide: S3_LIFECYCLE_PLAN.md
+JSON Policies:
+  - s3_lifecycle_aggressive.json
+  - s3_lifecycle_conservative.json
+  - s3_lifecycle_minimal.json
+
+═══════════════════════════════════════════════════════════════════
+

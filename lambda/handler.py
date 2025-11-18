@@ -279,28 +279,29 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
     """
     for attempt in range(max_retries):
         try:
-            # On retry (attempt > 0), delete any rows that may have been partially inserted
-            if attempt > 0:
-                logger.warning(f"⚠️  Retry attempt {attempt + 1}: Cleaning up potential duplicates before MERGE")
-                
-                # Build WHERE clause for primary keys from staging
-                key_cols_for_delete = key_cols_safe if key_cols_safe else keys
-                keys_csv = ", ".join([f'"{k}"' for k in key_cols_for_delete])
-                
-                cleanup_sql = f"""
-                DELETE FROM "public"."{table}"
-                WHERE ({keys_csv}) IN (
-                    SELECT {keys_csv}
-                    FROM "public"."{staging_table}"
-                )
-                """
-                
-                try:
-                    fb_connector.execute(cleanup_sql)
-                    logger.info(f"✓ Cleaned up potential duplicates for retry")
-                except Exception as cleanup_error:
-                    logger.warning(f"⚠️  Cleanup failed (non-fatal): {cleanup_error}")
-                    # Continue anyway - MERGE will handle it
+            # ALWAYS delete existing rows before MERGE to prevent duplicates
+            # This is critical because Firebolt's MVCC can partially commit data
+            # even when a transaction conflict occurs, leading to duplicates on retry
+            logger.info(f"🧹 Cleaning up existing rows before MERGE (attempt {attempt + 1}/{max_retries})")
+            
+            # Build WHERE clause for primary keys from staging
+            key_cols_for_delete = key_cols_safe if key_cols_safe else keys
+            keys_csv = ", ".join([f'"{k}"' for k in key_cols_for_delete])
+            
+            cleanup_sql = f"""
+            DELETE FROM "public"."{table}"
+            WHERE ({keys_csv}) IN (
+                SELECT {keys_csv}
+                FROM "public"."{staging_table}"
+            )
+            """
+            
+            try:
+                fb_connector.execute(cleanup_sql)
+                logger.info(f"✓ Pre-MERGE cleanup completed")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️  Pre-MERGE cleanup failed (non-fatal): {cleanup_error}")
+                # Continue anyway - MERGE will handle it
             
             merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr, key_cols_safe=key_cols_safe)
             logger.info(f"Generated MERGE SQL (first 500 chars): {merge_sql[:500]}")

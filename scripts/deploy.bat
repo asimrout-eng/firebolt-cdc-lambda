@@ -46,3 +46,5 @@ echo Next: Upload tables_keys.json:
 echo   aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tables_keys.json
 echo.
 
+
+

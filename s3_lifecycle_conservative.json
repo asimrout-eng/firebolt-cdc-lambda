@@ -1,0 +1,29 @@
+{
+  "Rules": [
+    {
+      "Id": "ArchiveOldCDCFiles-Conservative",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "firebolt_dms_job/"
+      },
+      "Transitions": [
+        {
+          "Days": 14,
+          "StorageClass": "INTELLIGENT_TIERING"
+        },
+        {
+          "Days": 60,
+          "StorageClass": "GLACIER_IR"
+        },
+        {
+          "Days": 180,
+          "StorageClass": "GLACIER"
+        }
+      ],
+      "Expiration": {
+        "Days": 365
+      }
+    }
+  ]
+}
+

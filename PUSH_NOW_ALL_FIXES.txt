@@ -1,0 +1,146 @@
+═══════════════════════════════════════════════════════════════════
+  🎯 THREE MAJOR IMPROVEMENTS - Ready to Push!
+═══════════════════════════════════════════════════════════════════
+
+CHANGE 1: HTTP Status Code Error Handling (Best Practice) ✅
+CHANGE 2: DECIMAL Precision Mismatch Fix ✅
+CHANGE 3: Corrected READ_PARQUET Syntax ✅
+
+═══════════════════════════════════════════════════════════════════
+  📋 COPY-PASTE THESE COMMANDS:
+═══════════════════════════════════════════════════════════════════
+
+cd /Users/asimkumarrout/Documents/Firebolt/Python/firebolt-cdk-package
+
+git add lambda/handler.py \
+       fix_cent_borrower_term_condition.sql \
+       HOW_TO_FIX_DECIMAL_PRECISION_ERRORS.md \
+       ERROR_HANDLING_BEST_PRACTICES.md
+
+git commit -m "🎯 Implement Firebolt best practices: HTTP status code error handling + DECIMAL fix
+
+1. HTTP Status Code Error Handling (Best Practice)
+   - Use status codes (409, 5xx, 4xx) instead of text matching
+   - Deterministic, language-agnostic, future-proof
+   - Follows Firebolt official best practices
+
+2. DECIMAL Precision Mismatch Fix
+   - Filter incompatible DECIMAL columns from MERGE
+   - Schema fix using READ_PARQUET (correct syntax)
+   
+3. Comprehensive Documentation
+   - ERROR_HANDLING_BEST_PRACTICES.md
+   - HOW_TO_FIX_DECIMAL_PRECISION_ERRORS.md"
+
+git push origin main
+
+═══════════════════════════════════════════════════════════════════
+  📊 WHAT CHANGED:
+═══════════════════════════════════════════════════════════════════
+
+File: lambda/handler.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Lines 218-330: execute_merge_with_retry()
+
+OLD (Text Matching):
+  if "conflict" in error_msg.lower():
+      retry()
+
+NEW (HTTP Status Codes):
+  if status_code == 409:
+      retry()  # Conflict
+  elif 500 <= status_code < 600:
+      retry()  # Server error
+  elif 400 <= status_code < 500:
+      don't_retry()  # Client error
+
+Benefits:
+  ✅ Robust, deterministic
+  ✅ Language-agnostic
+  ✅ Future-proof
+  ✅ Better logging
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Lines 384-431: DECIMAL Column Filtering
+
+NEW:
+  - Filter ALL DECIMAL columns with precision mismatches
+  - Skip from MERGE (UPDATE SET + INSERT VALUES)
+  - Log warnings
+  - Continue processing other columns
+
+Result:
+  ✅ No crashes on DECIMAL mismatches
+  ✅ Other columns still work
+  ✅ Clear warnings in logs
+
+═══════════════════════════════════════════════════════════════════
+
+File: fix_cent_borrower_term_condition.sql (NEW)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Quick fix for loan_id precision mismatch
+
+Syntax:
+  CREATE TABLE ... AS
+  SELECT * EXCLUDE ("Op", "load_timestamp")
+  FROM READ_PARQUET(
+      LOCATION => 's3_raw_dms',
+      PATTERN => 'fair/cent_borrower_term_condition/**/*.parquet'
+  )
+  LIMIT 0;
+
+═══════════════════════════════════════════════════════════════════
+
+File: ERROR_HANDLING_BEST_PRACTICES.md (NEW)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Complete guide to HTTP status code error handling
+
+Topics:
+  - Status code extraction
+  - Retry decision logic
+  - Fallback to text matching
+  - Example logs
+  - Monitoring commands
+
+═══════════════════════════════════════════════════════════════════
+
+File: HOW_TO_FIX_DECIMAL_PRECISION_ERRORS.md (NEW)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Complete guide to fixing DECIMAL precision mismatches
+
+Topics:
+  - Quick fix for single table
+  - Template for any table
+  - How to find other affected tables
+  - Whether to copy old data
+
+═══════════════════════════════════════════════════════════════════
+  🚀 AFTER PUSHING:
+═══════════════════════════════════════════════════════════════════
+
+1. Run SQL in Firebolt:
+   fix_cent_borrower_term_condition.sql
+
+2. Deploy Lambda:
+   cd <your-repo-folder>
+   git pull origin main
+   ./scripts/deploy.sh
+
+3. Monitor:
+   aws logs tail /aws/lambda/firebolt-cdc-processor \
+     --since 10m \
+     --region ap-south-1 \
+     | grep -E "(409|5[0-9]{2}|Conflict|Server Error)"
+
+═══════════════════════════════════════════════════════════════════
+  ✅ EXPECTED RESULTS:
+═══════════════════════════════════════════════════════════════════
+
+✓ Clear, categorized error logs with HTTP status codes
+✓ No crashes on DECIMAL mismatches
+✓ Proper retry logic following Firebolt best practices
+✓ DECIMAL columns filtered with warnings
+✓ Production-grade, maintainable code
+
+═══════════════════════════════════════════════════════════════════
+

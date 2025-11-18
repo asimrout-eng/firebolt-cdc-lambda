@@ -26,3 +26,5 @@ def get_config():
         'cdc_delete_values': os.getenv('CDC_DELETE_VALUES', ''),
     }
 
+
+

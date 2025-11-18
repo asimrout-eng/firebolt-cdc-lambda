@@ -90,3 +90,5 @@ class FireboltCdcStack(Stack):
         CfnOutput(self, "S3Trigger", value=f"s3://{config['s3_bucket_name']}/{config['s3_prefix']}*.parquet")
         CfnOutput(self, "LogGroup", value=lambda_function.log_group.log_group_name)
 
+
+

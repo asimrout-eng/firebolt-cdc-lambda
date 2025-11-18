@@ -38,3 +38,5 @@ Write-Host ""
 Write-Host "📝 Next: Upload tables_keys.json:" -ForegroundColor Yellow
 Write-Host "   aws s3 cp config\tables_keys.json s3://fcanalytics/firebolt-migration/config/tables_keys.json" -ForegroundColor White
 
+
+
