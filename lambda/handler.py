@@ -300,8 +300,10 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
                 fb_connector.execute(cleanup_sql)
                 logger.info(f"✓ Pre-MERGE cleanup completed")
             except Exception as cleanup_error:
-                logger.warning(f"⚠️  Pre-MERGE cleanup failed (non-fatal): {cleanup_error}")
-                # Continue anyway - MERGE will handle it
+                logger.error(f"✗ Pre-MERGE cleanup FAILED - cannot proceed safely: {cleanup_error}")
+                # CRITICAL: If DELETE fails, we CANNOT proceed with MERGE
+                # because it would create duplicates. Re-raise to trigger retry.
+                raise Exception(f"Pre-MERGE cleanup failed, aborting to prevent duplicates: {cleanup_error}")
             
             merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr, key_cols_safe=key_cols_safe)
             logger.info(f"Generated MERGE SQL (first 500 chars): {merge_sql[:500]}")
@@ -457,6 +459,168 @@ def cleanup_staging_table(staging_table, fb_connector, max_retries=3):
     
     return False
 
+# ═══════════════════════════════════════════════════════════════════
+# FILE DEDUPLICATION FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════
+
+def is_file_processed(file_key: str, fb_connector) -> tuple:
+    """
+    Check if file has already been processed
+    
+    Args:
+        file_key: Unique file identifier (database/table/YYYY/MM/DD/filename.parquet)
+        fb_connector: Firebolt connector instance
+    
+    Returns:
+        tuple: (is_processed: bool, status: str or None)
+    """
+    try:
+        # Escape single quotes in file_key
+        file_key_safe = file_key.replace("'", "''")
+        
+        check_sql = f"""
+        SELECT status, request_id, processed_at
+        FROM cdc_processed_files
+        WHERE file_key = '{file_key_safe}'
+        """
+        
+        cursor = fb_connector.execute(check_sql)
+        result = cursor.fetchone()
+        
+        if result:
+            status = result[0]
+            request_id = result[1]
+            processed_at = result[2]
+            
+            if status == 'completed':
+                logger.info(f"✓ File {file_key} already processed by {request_id}")
+                return True, status
+            
+            elif status == 'processing':
+                # Check if stale (processing for > 15 min = Lambda timeout)
+                if processed_at:
+                    from datetime import datetime
+                    if isinstance(processed_at, datetime):
+                        age_minutes = (datetime.now() - processed_at).total_seconds() / 60
+                    else:
+                        age_minutes = 0
+                    
+                    if age_minutes > 15:
+                        logger.warning(f"⚠️  File {file_key} stuck in 'processing' for {age_minutes:.1f} min, will retry")
+                        return False, status
+                
+                logger.info(f"⏳ File {file_key} currently being processed by another Lambda")
+                return True, status
+            
+            elif status == 'failed':
+                logger.info(f"⚠️  File {file_key} previously failed, will retry")
+                return False, status
+        
+        # Not found = not processed yet
+        logger.info(f"File {file_key} not yet processed")
+        return False, None
+        
+    except Exception as e:
+        logger.error(f"✗ Error checking if file processed: {e}")
+        # On error, proceed with processing (fail-open)
+        return False, None
+
+def mark_file_processing(file_key: str, request_id: str, lambda_arn: str, fb_connector) -> bool:
+    """
+    Mark file as currently being processed
+    
+    Args:
+        file_key: Unique file identifier
+        request_id: Lambda request ID
+        lambda_arn: Lambda ARN
+        fb_connector: Firebolt connector instance
+    
+    Returns:
+        bool: True if successfully marked, False if already being processed
+    """
+    try:
+        # Escape single quotes
+        file_key_safe = file_key.replace("'", "''")
+        request_id_safe = request_id.replace("'", "''")
+        lambda_arn_safe = lambda_arn.replace("'", "''")
+        
+        insert_sql = f"""
+        INSERT INTO cdc_processed_files (
+            file_key, 
+            request_id, 
+            processed_at, 
+            status, 
+            lambda_arn, 
+            attempt_count
+        )
+        VALUES (
+            '{file_key_safe}',
+            '{request_id_safe}',
+            CURRENT_TIMESTAMP,
+            'processing',
+            '{lambda_arn_safe}',
+            1
+        )
+        """
+        
+        fb_connector.execute(insert_sql)
+        logger.info(f"✓ Marked {file_key} as processing")
+        return True
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        
+        # Check if it's a duplicate key error
+        if "duplicate" in error_msg or "already exists" in error_msg or "unique" in error_msg or "constraint" in error_msg:
+            logger.warning(f"⚠️  File {file_key} already being processed by another Lambda")
+            return False
+        else:
+            logger.error(f"✗ Error marking file as processing: {e}")
+            # On unknown error, proceed anyway (fail-open)
+            return True
+
+def mark_file_completed(file_key: str, fb_connector) -> None:
+    """Mark file as successfully processed"""
+    try:
+        file_key_safe = file_key.replace("'", "''")
+        
+        update_sql = f"""
+        UPDATE cdc_processed_files
+        SET status = 'completed',
+            processed_at = CURRENT_TIMESTAMP
+        WHERE file_key = '{file_key_safe}'
+        """
+        
+        fb_connector.execute(update_sql)
+        logger.info(f"✓ Marked {file_key} as completed")
+        
+    except Exception as e:
+        logger.error(f"✗ Error marking file as completed: {e}")
+        # Non-fatal - file was processed successfully
+
+def mark_file_failed(file_key: str, error_message: str, fb_connector) -> None:
+    """Mark file as failed"""
+    try:
+        file_key_safe = file_key.replace("'", "''")
+        error_safe = str(error_message)[:1000].replace("'", "''")  # Truncate and escape
+        
+        update_sql = f"""
+        UPDATE cdc_processed_files
+        SET status = 'failed',
+            processed_at = CURRENT_TIMESTAMP,
+            error_message = '{error_safe}',
+            attempt_count = attempt_count + 1
+        WHERE file_key = '{file_key_safe}'
+        """
+        
+        fb_connector.execute(update_sql)
+        logger.info(f"✓ Marked {file_key} as failed")
+        
+    except Exception as e:
+        logger.error(f"✗ Error marking file as failed: {e}")
+
+# ═══════════════════════════════════════════════════════════════════
+
 # Regex to extract database, table, date, filename from S3 key
 # DMS format: firebolt_dms_job/<database>/<table>/YYYY/MM/DD/<filename>.parquet
 RE_KEY = re.compile(r'firebolt_dms_job/([^/]+)/([^/]+)/(\d{4})/(\d{2})/(\d{2})/([^/]+\.parquet)$')
@@ -497,6 +661,10 @@ def handler(event, context):
     date_path = f"{year}/{month}/{day}"    # For S3 COPY pattern
     logger.info(f"Database: {database}, Table: {table}, Date: {date_yyyymmdd}, File: {filename}")
     
+    # Create file_key for deduplication
+    file_key = f"{database}/{table}/{date_path}/{filename}"
+    logger.info(f"File key: {file_key}")
+    
     # Create unique suffix for staging table (prevents concurrency issues)
     unique_suffix = hashlib.md5(
         f"{table}_{date_yyyymmdd}_{filename}_{context.aws_request_id}".encode()
@@ -532,6 +700,53 @@ def handler(event, context):
     # Connect to Firebolt using SDK
     fb_connector = FireboltConnector()
     fb_connector.connect()
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # FILE DEDUPLICATION CHECK
+    # ═══════════════════════════════════════════════════════════════════
+    
+    logger.info("=" * 80)
+    logger.info("STEP 1: CHECK IF FILE ALREADY PROCESSED")
+    logger.info("=" * 80)
+    
+    is_processed, status = is_file_processed(file_key, fb_connector)
+    
+    if is_processed:
+        logger.info(f"✓ File {file_key} already processed (status: {status}), skipping")
+        elapsed = time.time() - start_time
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'File already processed',
+                'file_key': file_key,
+                'status': status,
+                'elapsed_seconds': elapsed
+            })
+        }
+    
+    logger.info("=" * 80)
+    logger.info("STEP 2: MARK FILE AS PROCESSING")
+    logger.info("=" * 80)
+    
+    if not mark_file_processing(file_key, request_id, context.invoked_function_arn, fb_connector):
+        logger.info(f"✓ File {file_key} being processed by another Lambda, skipping")
+        elapsed = time.time() - start_time
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'File being processed by another Lambda',
+                'file_key': file_key,
+                'elapsed_seconds': elapsed
+            })
+        }
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # PROCESS FILE (existing CDC logic)
+    # ═══════════════════════════════════════════════════════════════════
+    
+    logger.info("=" * 80)
+    logger.info("STEP 3: PROCESS FILE")
+    logger.info("=" * 80)
     
     # Get external location name
     location = os.environ["LOCATION_NAME"]
@@ -662,10 +877,25 @@ def handler(event, context):
         # Cleanup staging table
         cleanup_staging_table(staging_table, fb_connector)
         
+        # ═══════════════════════════════════════════════════════════════════
+        # MARK FILE AS COMPLETED
+        # ═══════════════════════════════════════════════════════════════════
+        
+        logger.info("=" * 80)
+        logger.info("STEP 4: MARK FILE AS COMPLETED")
+        logger.info("=" * 80)
+        
+        mark_file_completed(file_key, fb_connector)
+        
     except Exception as e:
         # Cleanup on error
         if staging_table:
             cleanup_staging_table(staging_table, fb_connector)
+        
+        # Mark file as failed
+        logger.error(f"✗ Error processing file: {e}")
+        mark_file_failed(file_key, str(e), fb_connector)
+        
         raise
     finally:
         # Always disconnect
