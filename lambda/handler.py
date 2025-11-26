@@ -619,6 +619,45 @@ def mark_file_failed(file_key: str, error_message: str, fb_connector) -> None:
     except Exception as e:
         logger.error(f"✗ Error marking file as failed: {e}")
 
+def cleanup_old_processed_files(fb_connector, days_to_keep: int = 30) -> None:
+    """
+    Clean up old records from cdc_processed_files table
+    
+    Args:
+        fb_connector: Firebolt connector instance
+        days_to_keep: Number of days to keep records (default: 30)
+    """
+    try:
+        logger.info(f"🧹 Cleaning up records older than {days_to_keep} days from cdc_processed_files")
+        
+        # Get count before deletion
+        count_sql = "SELECT COUNT(*) FROM cdc_processed_files"
+        cursor = fb_connector.execute(count_sql)
+        before_count = cursor.fetchone()[0]
+        
+        # Delete old records
+        delete_sql = f"""
+        DELETE FROM cdc_processed_files
+        WHERE processed_at < CURRENT_TIMESTAMP - INTERVAL '{days_to_keep}' DAY
+        """
+        
+        fb_connector.execute(delete_sql)
+        
+        # Get count after deletion
+        cursor = fb_connector.execute(count_sql)
+        after_count = cursor.fetchone()[0]
+        
+        deleted = before_count - after_count
+        
+        if deleted > 0:
+            logger.info(f"✓ Cleanup complete: Deleted {deleted:,} old records (before: {before_count:,}, after: {after_count:,})")
+        else:
+            logger.info(f"✓ Cleanup complete: No old records to delete (total: {after_count:,})")
+        
+    except Exception as e:
+        # Non-fatal - log error but don't fail Lambda
+        logger.warning(f"⚠️  Cleanup failed (non-fatal): {e}")
+
 # ═══════════════════════════════════════════════════════════════════
 
 # Regex to extract database, table, date, filename from S3 key
@@ -700,6 +739,19 @@ def handler(event, context):
     # Connect to Firebolt using SDK
     fb_connector = FireboltConnector()
     fb_connector.connect()
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # PERIODIC CLEANUP OF OLD RECORDS
+    # ═══════════════════════════════════════════════════════════════════
+    
+    # Run cleanup occasionally (1% of invocations) to prevent table bloat
+    # This keeps the cdc_processed_files table size manageable
+    cleanup_probability = float(os.environ.get('CLEANUP_PROBABILITY', '0.01'))  # Default: 1%
+    cleanup_days = int(os.environ.get('CLEANUP_DAYS_TO_KEEP', '30'))  # Default: 30 days
+    
+    if random.random() < cleanup_probability:
+        logger.info("🧹 Running periodic cleanup of old processed files records")
+        cleanup_old_processed_files(fb_connector, days_to_keep=cleanup_days)
     
     # ═══════════════════════════════════════════════════════════════════
     # FILE DEDUPLICATION CHECK
