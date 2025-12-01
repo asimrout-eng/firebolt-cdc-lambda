@@ -722,14 +722,65 @@ def handler(event, context):
     
     # Get primary keys for this table
     keys = table_keys.get(table)
-    if not keys:
-        raise RuntimeError(f"No keys configured for table {table}")
+    
+    # Handle tables with null primary keys (skip CDC)
+    if keys is None:
+        logger.warning(f"⚠️  Table '{table}' has null primary key - no CDC configured")
+        
+        # Check if this is a CDC file (timestamp format) or full load file
+        is_cdc_file = bool(re.match(r'\d{8}-\d+\.parquet$', filename))
+        
+        # Connect to Firebolt for file tracking
+        fb_connector = FireboltConnector()
+        fb_connector.connect()
+        
+        try:
+            if is_cdc_file:
+                # CDC file but no primary key - skip processing
+                logger.info(f"✓ Skipping CDC file (no PK configured): {file_key}")
+                logger.info(f"  Recommendation: Configure primary key or use scheduled full load")
+                
+                # Mark as completed to prevent retry loops
+                mark_file_completed(file_key, fb_connector)
+                
+                elapsed = time.time() - start_time
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'message': 'CDC skipped - no primary key configured',
+                        'table': table,
+                        'file': filename,
+                        'strategy': 'null_pk_skipped',
+                        'elapsed_seconds': elapsed
+                    })
+                }
+            else:
+                # Full load file - skip for now (can be processed by scheduled Lambda)
+                logger.info(f"✓ Skipping full load file (no PK configured): {file_key}")
+                logger.info(f"  Recommendation: Use scheduled full load Lambda for this table")
+                
+                # Mark as completed
+                mark_file_completed(file_key, fb_connector)
+                
+                elapsed = time.time() - start_time
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'message': 'Full load skipped - no primary key configured',
+                        'table': table,
+                        'file': filename,
+                        'recommendation': 'Use scheduled Lambda for full loads',
+                        'elapsed_seconds': elapsed
+                    })
+                }
+        finally:
+            fb_connector.disconnect()
     
     # Convert single key to list for uniform handling
     if isinstance(keys, str):
         keys = [keys]
     
-    logger.info(f"Primary keys for {table}: {keys}")
+    logger.info(f"✓ Primary keys for {table}: {keys}")
     
     # Optional: Handle CDC deletes (tombstones)
     # Note: delete_expr will be validated later (after we know staging table columns)
