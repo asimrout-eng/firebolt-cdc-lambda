@@ -64,6 +64,8 @@ class FireboltCdcStack(Stack):
                 "FIREBOLT_ENGINE": config.get('firebolt_engine', ''),
                 "FIREBOLT_USERNAME": config.get('firebolt_username', ''),
                 "FIREBOLT_PASSWORD": config.get('firebolt_password', ''),
+                "FIREBOLT_CLIENT_ID": config.get('firebolt_client_id', ''),
+                "FIREBOLT_CLIENT_SECRET": config.get('firebolt_client_secret', ''),
                 "LOCATION_NAME": config.get('location_name', 's3_raw_dms'),
                 "TABLE_KEYS_S3_BUCKET": config.get('table_keys_s3_bucket', ''),
                 "TABLE_KEYS_S3_KEY": config.get('table_keys_s3_key', ''),
@@ -89,6 +91,7 @@ class FireboltCdcStack(Stack):
         CfnOutput(self, "LambdaFunctionArn", value=lambda_function.function_arn)
         CfnOutput(self, "S3Trigger", value=f"s3://{config['s3_bucket_name']}/{config['s3_prefix']}*.parquet")
         CfnOutput(self, "LogGroup", value=lambda_function.log_group.log_group_name)
+
 
 
 

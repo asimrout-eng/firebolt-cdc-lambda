@@ -19,12 +19,15 @@ def get_config():
         'firebolt_engine': os.getenv('FIREBOLT_ENGINE', ''),
         'firebolt_username': os.getenv('FIREBOLT_USERNAME', ''),
         'firebolt_password': os.getenv('FIREBOLT_PASSWORD', ''),
+        'firebolt_client_id': os.getenv('FIREBOLT_CLIENT_ID', ''),
+        'firebolt_client_secret': os.getenv('FIREBOLT_CLIENT_SECRET', ''),
         'location_name': os.getenv('LOCATION_NAME', 's3_raw_dms'),
         'table_keys_s3_bucket': os.getenv('TABLE_KEYS_S3_BUCKET', 'fcanalytics'),
         'table_keys_s3_key': os.getenv('TABLE_KEYS_S3_KEY', 'firebolt-migration/config/tables_keys.json'),
         'cdc_delete_column': os.getenv('CDC_DELETE_COLUMN', ''),
         'cdc_delete_values': os.getenv('CDC_DELETE_VALUES', ''),
     }
+
 
 
 
