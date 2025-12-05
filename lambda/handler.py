@@ -756,11 +756,12 @@ def handler(event, context):
         # Check if this is a CDC file (timestamp format) or full load file
         is_cdc_file = bool(re.match(r'\d{8}-\d+\.parquet$', filename))
         
-        # Connect to Firebolt for file tracking
-        fb_connector = FireboltConnector()
-        fb_connector.connect()
-        
+        # Connect to Firebolt for file tracking (inside try block to handle connection errors)
+        fb_connector = None
         try:
+            fb_connector = FireboltConnector()
+            fb_connector.connect()
+            
             if is_cdc_file:
                 # CDC file but no primary key - skip processing
                 logger.info(f"✓ Skipping CDC file (no PK configured): {file_key}")
@@ -799,8 +800,33 @@ def handler(event, context):
                         'elapsed_seconds': elapsed
                     })
                 }
+        except Exception as e:
+            # Gracefully handle connection errors - don't crash Lambda
+            logger.error(f"✗ Error connecting to Firebolt to mark file as completed: {e}")
+            logger.error(f"  File: {file_key}")
+            logger.error(f"  Table has null PK - skipping CDC processing")
+            logger.warning(f"  ⚠️  File will be retried by S3, but will fail again if connection issue persists")
+            
+            # Return success to prevent infinite retry loop
+            # (The file will be processed when connection is restored, but will be skipped again)
+            elapsed = time.time() - start_time
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'CDC skipped - connection error while marking file',
+                    'table': table,
+                    'file': filename,
+                    'error': str(e),
+                    'elapsed_seconds': elapsed
+                })
+            }
         finally:
-            fb_connector.disconnect()
+            # Safe disconnect
+            if fb_connector:
+                try:
+                    fb_connector.disconnect()
+                except:
+                    pass  # Ignore disconnect errors
     
     # Convert single key to list for uniform handling
     if isinstance(keys, str):
