@@ -467,6 +467,8 @@ def is_file_processed(file_key: str, fb_connector) -> tuple:
     """
     Check if file has already been processed
     
+    Also checks for batch_processed markers from manual CDC processing.
+    
     Args:
         file_key: Unique file identifier (database/table/YYYY/MM/DD/filename.parquet)
         fb_connector: Firebolt connector instance
@@ -515,6 +517,30 @@ def is_file_processed(file_key: str, fb_connector) -> tuple:
             elif status == 'failed':
                 logger.info(f"⚠️  File {file_key} previously failed, will retry")
                 return False, status
+        
+        # STEP 2: Check for batch_processed marker (manual CDC processing)
+        # Extract date_path from file_key: database/table/YYYY/MM/DD/filename.parquet
+        # We want to check: database/table/YYYY/MM/DD/batch_processed
+        parts = file_key.split('/')
+        if len(parts) >= 4:
+            # Reconstruct path up to date: database/table/YYYY/MM/DD
+            date_path = '/'.join(parts[:-1])  # Everything except filename
+            batch_marker = f"{date_path}/batch_processed"
+            batch_marker_safe = batch_marker.replace("'", "''")
+            
+            batch_check_sql = f"""
+            SELECT status, processed_at
+            FROM cdc_processed_files
+            WHERE file_key = '{batch_marker_safe}'
+              AND status = 'completed'
+            """
+            
+            cursor = fb_connector.execute(batch_check_sql)
+            batch_result = cursor.fetchone()
+            
+            if batch_result:
+                logger.info(f"✓ Date {date_path} was batch processed manually - skipping file {file_key}")
+                return True, 'batch_processed'
         
         # Not found = not processed yet
         logger.info(f"File {file_key} not yet processed")
