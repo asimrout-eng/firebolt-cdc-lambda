@@ -9,6 +9,242 @@ from firebolt.client.auth import UsernamePassword, ClientCredentials
 from typing import Optional, Any
 import firebolt
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCHEMA EVOLUTION - Auto-add new columns from Parquet files
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# MySQL/DMS to Firebolt type mapping
+MYSQL_TO_FIREBOLT_TYPE_MAP = {
+    # String types
+    'STRING': 'TEXT',
+    'VARCHAR': 'TEXT',
+    'CHAR': 'TEXT',
+    'TINYTEXT': 'TEXT',
+    'MEDIUMTEXT': 'TEXT',
+    'LONGTEXT': 'TEXT',
+    'TEXT': 'TEXT',
+    'ENUM': 'TEXT',
+    'SET': 'TEXT',
+    
+    # Integer types
+    'TINYINT': 'INTEGER',
+    'SMALLINT': 'INTEGER',
+    'MEDIUMINT': 'INTEGER',
+    'INT': 'INTEGER',
+    'INTEGER': 'INTEGER',
+    'BIGINT': 'BIGINT',
+    'INT64': 'BIGINT',
+    'INT32': 'INTEGER',
+    'INT16': 'INTEGER',
+    'INT8': 'INTEGER',
+    
+    # Boolean
+    'BOOLEAN': 'BOOLEAN',
+    'BOOL': 'BOOLEAN',
+    'BIT': 'BOOLEAN',
+    
+    # Decimal/Numeric - Use (38, 10) as safe default
+    'DECIMAL': 'NUMERIC(38, 10)',
+    'NUMERIC': 'NUMERIC(38, 10)',
+    'NUMBER': 'NUMERIC(38, 10)',
+    'FLOAT': 'DOUBLE',
+    'DOUBLE': 'DOUBLE',
+    'REAL': 'DOUBLE',
+    'FLOAT64': 'DOUBLE',
+    'FLOAT32': 'REAL',
+    
+    # Date/Time types
+    'DATE': 'DATE',
+    'DATETIME': 'TIMESTAMP',
+    'TIMESTAMP': 'TIMESTAMPTZ',
+    'TIMESTAMPTZ': 'TIMESTAMPTZ',
+    'TIME': 'TEXT',  # Firebolt doesn't have TIME type
+    'YEAR': 'INTEGER',
+    
+    # Binary types - convert to TEXT
+    'BLOB': 'TEXT',
+    'TINYBLOB': 'TEXT',
+    'MEDIUMBLOB': 'TEXT',
+    'LONGBLOB': 'TEXT',
+    'BINARY': 'TEXT',
+    'VARBINARY': 'TEXT',
+    'BYTEA': 'TEXT',
+    
+    # JSON
+    'JSON': 'TEXT',
+    'JSONB': 'TEXT',
+    
+    # UUID
+    'UUID': 'TEXT',
+    
+    # Spatial (cannot auto-convert)
+    'GEOMETRY': None,
+    'POINT': None,
+    'LINESTRING': None,
+    'POLYGON': None,
+    'GEOGRAPHY': None,
+}
+
+# Types safe to auto-add
+SAFE_AUTO_ADD_TYPES = {
+    'TEXT', 'VARCHAR', 'STRING', 'CHAR',
+    'INTEGER', 'INT', 'BIGINT', 'SMALLINT', 'TINYINT',
+    'BOOLEAN', 'BOOL',
+    'DATE', 'TIMESTAMP', 'TIMESTAMPTZ',
+    'DOUBLE', 'FLOAT', 'REAL',
+    'NUMERIC', 'DECIMAL', 'NUMBER'
+}
+
+# Types requiring manual intervention
+MANUAL_INTERVENTION_TYPES = {'ARRAY', 'STRUCT', 'MAP', 'GEOMETRY', 'POINT', 'POLYGON'}
+
+
+def get_column_details_for_evolution(schema: str, table: str, fb_connector) -> dict:
+    """Get column names and data types for schema evolution"""
+    q = f"""
+    SELECT column_name, data_type 
+    FROM information_schema.columns 
+    WHERE table_schema = '{schema}' AND table_name = '{table}'
+    ORDER BY ordinal_position
+    """
+    cursor = fb_connector.execute(q)
+    return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+def normalize_type(data_type: str) -> str:
+    """Extract base type without precision/scale"""
+    if not data_type:
+        return 'UNKNOWN'
+    return data_type.upper().split('(')[0].strip()
+
+
+def convert_to_firebolt_type(source_type: str) -> tuple:
+    """
+    Convert source type to Firebolt type.
+    Returns: (firebolt_type, is_safe, message)
+    """
+    if not source_type:
+        return None, False, "Empty source type"
+    
+    base_type = normalize_type(source_type)
+    
+    # Already valid Firebolt type?
+    if base_type in SAFE_AUTO_ADD_TYPES:
+        return source_type, True, "Already valid"
+    
+    # Lookup in mapping
+    if base_type in MYSQL_TO_FIREBOLT_TYPE_MAP:
+        firebolt_type = MYSQL_TO_FIREBOLT_TYPE_MAP[base_type]
+        if firebolt_type is None:
+            return None, False, f"Type {base_type} requires manual conversion"
+        
+        # Preserve precision for DECIMAL/NUMERIC
+        if ('DECIMAL' in source_type.upper() or 'NUMERIC' in source_type.upper()) and '(' in source_type:
+            precision = source_type[source_type.index('('):source_type.index(')')+1]
+            firebolt_type = f'NUMERIC{precision}'
+        
+        return firebolt_type, True, f"Converted from {base_type}"
+    
+    # Manual intervention required?
+    if base_type in MANUAL_INTERVENTION_TYPES:
+        return None, False, f"Type {base_type} cannot be auto-converted"
+    
+    # Unknown - try TEXT as fallback
+    logger.warning(f"Unknown type '{source_type}', using TEXT fallback")
+    return 'TEXT', False, f"Unknown type {source_type} - using TEXT"
+
+
+def handle_schema_evolution(
+    staging_table: str,
+    production_table: str,
+    fb_connector,
+    auto_add: bool = True,
+    sns_topic_arn: str = None
+) -> dict:
+    """
+    Detect and handle schema evolution between staging and production tables.
+    
+    Returns dict with results.
+    """
+    result = {
+        'new_columns': [],
+        'columns_added': [],
+        'columns_skipped': [],
+        'requires_manual': []
+    }
+    
+    # Get column details
+    staging_cols = get_column_details_for_evolution("public", staging_table, fb_connector)
+    prod_cols = get_column_details_for_evolution("public", production_table, fb_connector)
+    
+    # Exclude CDC metadata
+    exclude_cols = {'Op', 'load_timestamp', 'rn'}
+    
+    # Find new columns
+    for col_name, staging_type in staging_cols.items():
+        if col_name in exclude_cols:
+            continue
+        
+        if col_name not in prod_cols:
+            result['new_columns'].append((col_name, staging_type))
+            
+            # Convert type
+            firebolt_type, is_safe, message = convert_to_firebolt_type(staging_type)
+            
+            if firebolt_type and is_safe and auto_add:
+                # Auto-add column
+                try:
+                    alter_sql = f'ALTER TABLE "public"."{production_table}" ADD COLUMN "{col_name}" {firebolt_type} NULL'
+                    fb_connector.execute(alter_sql)
+                    logger.info(f"✓ Schema evolution: Added column '{col_name}' ({firebolt_type}) to {production_table}")
+                    result['columns_added'].append(col_name)
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to add column '{col_name}': {e}")
+                    result['columns_skipped'].append((col_name, str(e)))
+                    result['requires_manual'].append({
+                        'column': col_name,
+                        'source_type': staging_type,
+                        'target_type': firebolt_type,
+                        'reason': str(e)
+                    })
+            else:
+                result['columns_skipped'].append((col_name, message))
+                result['requires_manual'].append({
+                    'column': col_name,
+                    'source_type': staging_type,
+                    'target_type': firebolt_type,
+                    'reason': message
+                })
+                logger.warning(f"⚠️ Manual action needed for column '{col_name}' ({staging_type}): {message}")
+    
+    # Send SNS notification for manual actions
+    if result['requires_manual'] and sns_topic_arn:
+        try:
+            import boto3
+            sns = boto3.client('sns')
+            
+            message_lines = [
+                f"⚠️ SCHEMA EVOLUTION - Manual Action Required",
+                f"",
+                f"Table: {production_table}",
+                f"Columns: {len(result['requires_manual'])}",
+                f""
+            ]
+            for item in result['requires_manual']:
+                message_lines.append(f"  • {item['column']}: {item['source_type']} → {item.get('target_type', 'N/A')}")
+                message_lines.append(f"    Reason: {item['reason']}")
+            
+            sns.publish(
+                TopicArn=sns_topic_arn,
+                Subject=f"[Firebolt CDC] Schema Evolution - {production_table}",
+                Message="\n".join(message_lines)
+            )
+            logger.info("✓ Sent SNS notification for schema evolution")
+        except Exception as e:
+            logger.warning(f"Could not send SNS notification: {e}")
+    
+    return result
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -918,6 +1154,30 @@ def handler(event, context):
         copy_sql = render_copy_single_file(staging_table, table, date_path, filename, location, database)
         fb_connector.execute(copy_sql)
         logger.info(f"✓ Copied {filename} to {staging_table} (auto-created from parquet schema)")
+
+# ═══════════════════════════════════════════════════════════════════
+        # SCHEMA EVOLUTION: Auto-add new columns from Parquet
+        # ═══════════════════════════════════════════════════════════════════
+        schema_evolution_enabled = os.environ.get('SCHEMA_EVOLUTION_ENABLED', 'false').lower() == 'true'
+        schema_evolution_sns = os.environ.get('SCHEMA_EVOLUTION_SNS_TOPIC')
+        
+        if schema_evolution_enabled:
+            logger.info("🔍 Checking for schema evolution...")
+            evolution_result = handle_schema_evolution(
+                staging_table=staging_table,
+                production_table=table,
+                fb_connector=fb_connector,
+                auto_add=True,
+                sns_topic_arn=schema_evolution_sns
+            )
+            
+            if evolution_result['columns_added']:
+                logger.info(f"✓ Schema evolved: added columns {evolution_result['columns_added']}")
+            
+            if evolution_result['requires_manual']:
+                logger.warning(f"⚠️ {len(evolution_result['requires_manual'])} columns require manual action")
+        
+        # Continue with existing code...
         
         # Get column list from PRODUCTION table (not staging) to ensure schema compatibility
         # We only merge columns that exist in production
