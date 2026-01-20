@@ -1276,6 +1276,16 @@ def handler(event, context):
             else:
                 logger.warning(f"CDC delete column '{delete_col}' not found in staging table, skipping delete handling")
         
+        # ═══════════════════════════════════════════════════════════════════
+        # NOTE: DEDUPLICATION IS INTENTIONALLY DISABLED
+        # ═══════════════════════════════════════════════════════════════════
+        # Deduplication was removed because it was causing data loss:
+        # - When same primary key appears in multiple CDC files (e.g., INSERT then UPDATE)
+        # - Deduplication kept only the latest row, losing the INSERT operation
+        # - MERGE handles duplicates correctly by processing all operations
+        # - Result: All legitimate rows are preserved without data loss
+        # ═══════════════════════════════════════════════════════════════════
+        
         # Execute MERGE with retry logic for transaction conflicts
         # Increased retries to handle high-contention tables
         execute_merge_with_retry(
