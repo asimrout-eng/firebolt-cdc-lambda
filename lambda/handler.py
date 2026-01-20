@@ -643,6 +643,112 @@ def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, del
                 logger.error(f"   Primary keys: {keys}")
                 raise
 
+def deduplicate_staging_table(staging_table, table, keys, cols_staging, fb_connector):
+    """Deduplicate staging table before MERGE to prevent duplicate primary keys
+    
+    Uses table-specific timestamp columns to determine which row to keep:
+    - users: uses 'access' or 'changed' (prefers access)
+    - sessions: uses 'timestamp'
+    - Other tables: uses 'load_timestamp' if available, otherwise arbitrary
+    
+    Args:
+        staging_table: Name of staging table
+        table: Target table name (for table-specific logic)
+        keys: Primary key columns
+        cols_staging: List of columns in staging table
+        fb_connector: Firebolt connector instance
+    
+    Returns:
+        True if deduplication was performed, False if not needed
+    """
+    try:
+        # Convert keys to list if needed
+        if isinstance(keys, str):
+            keys_list = [keys]
+        else:
+            keys_list = keys
+        
+        # Check if there are duplicate primary keys
+        keys_csv = ", ".join([f'"{k}"' for k in keys_list])
+        check_duplicates_sql = f"""
+        SELECT COUNT(*) as total_rows,
+               COUNT(DISTINCT ({keys_csv})) as distinct_keys
+        FROM "public"."{staging_table}"
+        """
+        cursor = fb_connector.execute(check_duplicates_sql)
+        total_rows, distinct_keys = cursor.fetchone()
+        
+        if total_rows == distinct_keys:
+            logger.info(f"✓ No duplicate primary keys in staging table (all {total_rows} rows are unique)")
+            return False
+        
+        duplicates = total_rows - distinct_keys
+        logger.info(f"⚠️  Found {duplicates} duplicate primary keys in staging table, deduplicating...")
+        
+        # Determine which timestamp column to use for ordering
+        timestamp_col = None
+        
+        # Table-specific timestamp column preferences
+        if table == "users":
+            # For users table, prefer 'access' (last access time), fallback to 'changed'
+            if "access" in cols_staging:
+                timestamp_col = "access"
+                logger.info("Using 'access' column for users table deduplication")
+            elif "changed" in cols_staging:
+                timestamp_col = "changed"
+                logger.info("Using 'changed' column for users table deduplication")
+        elif table == "sessions":
+            # For sessions table, use 'timestamp'
+            if "timestamp" in cols_staging:
+                timestamp_col = "timestamp"
+                logger.info("Using 'timestamp' column for sessions table deduplication")
+        else:
+            # For other tables, use 'load_timestamp' if available
+            if "load_timestamp" in cols_staging:
+                timestamp_col = "load_timestamp"
+                logger.info("Using 'load_timestamp' column for deduplication")
+        
+        # Build ORDER BY clause
+        if timestamp_col:
+            order_by = f'"{timestamp_col}" DESC'
+            logger.info(f"Deduplicating by keeping latest row per primary key (ordered by {timestamp_col})")
+        else:
+            # No timestamp - use primary key for ordering (arbitrary, but deterministic)
+            order_by = keys_csv
+            logger.info("No timestamp column found - keeping arbitrary row per primary key")
+        
+        # Create deduplicated table
+        dedup_sql = f"""
+        CREATE TABLE "{staging_table}_dedup" AS
+        SELECT *
+        FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (PARTITION BY {keys_csv} ORDER BY {order_by}) as rn
+            FROM "public"."{staging_table}"
+        ) t
+        WHERE rn = 1
+        """
+        
+        fb_connector.execute(dedup_sql)
+        logger.info("✓ Deduplicated table created")
+        
+        # Verify row count
+        cursor = fb_connector.execute(f'SELECT COUNT(*) FROM "{staging_table}_dedup"')
+        dedup_count = cursor.fetchone()[0]
+        logger.info(f"✓ Deduplicated table has {dedup_count:,} rows (removed {duplicates} duplicates)")
+        
+        # Drop original and rename deduplicated table
+        fb_connector.execute(f'DROP TABLE IF EXISTS "{staging_table}"')
+        fb_connector.execute(f'ALTER TABLE "{staging_table}_dedup" RENAME TO "{staging_table}"')
+        logger.info("✓ Staging table deduplicated successfully")
+        
+        return True
+        
+    except Exception as e:
+        logger.warning(f"⚠️  Deduplication failed (may not be needed): {e}")
+        logger.info("Proceeding with original staging table...")
+        return False
+
 def cleanup_staging_table(staging_table, fb_connector, max_retries=3):
     """Drop temporary staging table with retry logic
     
@@ -1184,6 +1290,21 @@ def handler(event, context):
         cols_production = get_columns("public", table, fb_connector)
         
         # Get columns and data types from staging table
+        cols_staging = get_columns("public", staging_table, fb_connector)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # DEDUPLICATE STAGING TABLE - DISABLED
+        # ═══════════════════════════════════════════════════════════════════
+        # DEDUPLICATION IS DISABLED - MERGE handles duplicates correctly
+        # Deduplication was removing legitimate rows when same primary key
+        # appeared in multiple CDC files (e.g., INSERT then UPDATE).
+        # Without deduplication, MERGE correctly processes all operations.
+        # 
+        # Previous logic (DISABLED):
+        # deduplicate_staging_table(staging_table, table, keys, cols_staging, fb_connector)
+        logger.info("⚠️  Deduplication DISABLED - MERGE will handle all rows from staging table")
+        
+        # Refresh staging columns after dedup (in case structure changed)
         cols_staging = get_columns("public", staging_table, fb_connector)
         col_types_staging = get_column_types("public", staging_table, fb_connector)
         col_types_production = get_column_types("public", table, fb_connector)
