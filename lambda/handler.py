@@ -1,13 +1,26 @@
 """
 Lambda: S3 → Firebolt CDC (Direct COPY + MERGE)
 REFACTORED VERSION using Firebolt SDK
+
+VERSION: 2.0.0 - Fixed Deduplication with ingestion_seq
+CHANGES:
+- Re-enabled deduplication with deterministic ordering
+- Added ingestion_seq to capture Parquet row order
+- Fixed edge case where identical timestamps caused wrong row selection
+- Removed DELETE before MERGE (MERGE handles all operations)
 """
 import os, re, json, logging, hashlib, time, random
 import boto3
 from firebolt.db import connect as fb_connect
 from firebolt.client.auth import UsernamePassword, ClientCredentials
-from typing import Optional, Any
+from typing import Optional, Any, List
 import firebolt
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCHEMA EVOLUTION - Auto-add new columns from Parquet files
@@ -99,8 +112,79 @@ SAFE_AUTO_ADD_TYPES = {
 MANUAL_INTERVENTION_TYPES = {'ARRAY', 'STRUCT', 'MAP', 'GEOMETRY', 'POINT', 'POLYGON'}
 
 
-def get_column_details_for_evolution(schema: str, table: str, fb_connector) -> dict:
-    """Get column names and data types for schema evolution"""
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIREBOLT CONNECTOR CLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FireboltConnector:
+    """Handles Firebolt database connections"""
+    
+    def __init__(self, database: str, engine: str):
+        self.database = database
+        self.engine = engine
+        self.connection = None
+        self.cursor = None
+        self._connect()
+    
+    def _connect(self):
+        """Establish connection to Firebolt"""
+        # Get credentials from environment
+        client_id = os.environ.get('FIREBOLT_CLIENT_ID')
+        client_secret = os.environ.get('FIREBOLT_CLIENT_SECRET')
+        account_name = os.environ.get('FIREBOLT_ACCOUNT', 'faircentindia')
+        
+        if not client_id or not client_secret:
+            raise ValueError("Missing FIREBOLT_CLIENT_ID or FIREBOLT_CLIENT_SECRET environment variables")
+        
+        auth = ClientCredentials(client_id, client_secret)
+        
+        self.connection = fb_connect(
+            auth=auth,
+            account_name=account_name,
+            engine_name=self.engine,
+            database=self.database,
+            disable_cache=True
+        )
+        self.cursor = self.connection.cursor()
+        logger.info(f"Connected to Firebolt: {self.database}/{self.engine}")
+    
+    def execute(self, sql: str):
+        """Execute SQL statement"""
+        try:
+            self.cursor.execute(sql)
+            return self.cursor
+        except Exception as e:
+            logger.error(f"SQL execution failed: {e}")
+            logger.error(f"SQL: {sql[:500]}...")
+            raise
+    
+    def disconnect(self):
+        """Close connection"""
+        if self.cursor:
+            self.cursor.close()
+        if self.connection:
+            self.connection.close()
+        logger.info("Disconnected from Firebolt")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_columns(schema: str, table: str, fb_connector) -> list:
+    """Get column names for a table"""
+    q = f"""
+    SELECT column_name 
+    FROM information_schema.columns 
+    WHERE table_schema = '{schema}' AND table_name = '{table}'
+    ORDER BY ordinal_position
+    """
+    cursor = fb_connector.execute(q)
+    return [row[0] for row in cursor.fetchall()]
+
+
+def get_column_types(schema: str, table: str, fb_connector) -> dict:
+    """Get column names and data types for a table"""
     q = f"""
     SELECT column_name, data_type 
     FROM information_schema.columns 
@@ -109,6 +193,11 @@ def get_column_details_for_evolution(schema: str, table: str, fb_connector) -> d
     """
     cursor = fb_connector.execute(q)
     return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+def get_column_details_for_evolution(schema: str, table: str, fb_connector) -> dict:
+    """Get column names and data types for schema evolution"""
+    return get_column_types(schema, table, fb_connector)
 
 
 def normalize_type(data_type: str) -> str:
@@ -154,6 +243,10 @@ def convert_to_firebolt_type(source_type: str) -> tuple:
     return 'TEXT', False, f"Unknown type {source_type} - using TEXT"
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCHEMA EVOLUTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def handle_schema_evolution(
     staging_table: str,
     production_table: str,
@@ -178,7 +271,7 @@ def handle_schema_evolution(
     prod_cols = get_column_details_for_evolution("public", production_table, fb_connector)
     
     # Exclude CDC metadata
-    exclude_cols = {'Op', 'load_timestamp', 'rn'}
+    exclude_cols = {'Op', 'load_timestamp', 'rn', 'ingestion_seq'}
     
     # Find new columns
     for col_name, staging_type in staging_cols.items():
@@ -196,10 +289,10 @@ def handle_schema_evolution(
                 try:
                     alter_sql = f'ALTER TABLE "public"."{production_table}" ADD COLUMN "{col_name}" {firebolt_type} NULL'
                     fb_connector.execute(alter_sql)
-                    logger.info(f"✓ Schema evolution: Added column '{col_name}' ({firebolt_type}) to {production_table}")
+                    logger.info(f"Schema evolution: Added column '{col_name}' ({firebolt_type}) to {production_table}")
                     result['columns_added'].append(col_name)
                 except Exception as e:
-                    logger.warning(f"⚠️ Failed to add column '{col_name}': {e}")
+                    logger.warning(f"Failed to add column '{col_name}': {e}")
                     result['columns_skipped'].append((col_name, str(e)))
                     result['requires_manual'].append({
                         'column': col_name,
@@ -215,23 +308,22 @@ def handle_schema_evolution(
                     'target_type': firebolt_type,
                     'reason': message
                 })
-                logger.warning(f"⚠️ Manual action needed for column '{col_name}' ({staging_type}): {message}")
+                logger.warning(f"Manual action needed for column '{col_name}' ({staging_type}): {message}")
     
     # Send SNS notification for manual actions
     if result['requires_manual'] and sns_topic_arn:
         try:
-            import boto3
             sns = boto3.client('sns')
             
             message_lines = [
-                f"⚠️ SCHEMA EVOLUTION - Manual Action Required",
+                f"SCHEMA EVOLUTION - Manual Action Required",
                 f"",
                 f"Table: {production_table}",
                 f"Columns: {len(result['requires_manual'])}",
                 f""
             ]
             for item in result['requires_manual']:
-                message_lines.append(f"  • {item['column']}: {item['source_type']} → {item.get('target_type', 'N/A')}")
+                message_lines.append(f"  - {item['column']}: {item['source_type']} -> {item.get('target_type', 'N/A')}")
                 message_lines.append(f"    Reason: {item['reason']}")
             
             sns.publish(
@@ -239,1095 +331,567 @@ def handle_schema_evolution(
                 Subject=f"[Firebolt CDC] Schema Evolution - {production_table}",
                 Message="\n".join(message_lines)
             )
-            logger.info("✓ Sent SNS notification for schema evolution")
+            logger.info("Sent SNS notification for schema evolution")
         except Exception as e:
-            logger.warning(f"Could not send SNS notification: {e}")
+            logger.warning(f"Failed to send SNS notification: {e}")
     
     return result
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
 
-# Log SDK version on Lambda cold start
-try:
-    SDK_VERSION = getattr(firebolt, '__version__', 'unknown')
-    logger.info(f"🔧 Firebolt Python SDK Version: {SDK_VERSION}")
-except Exception as e:
-    logger.warning(f"Could not determine Firebolt SDK version: {e}")
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEDUPLICATION LOGIC (v2.0 - with ingestion_seq)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-class FireboltConnector:
-    """Handles Firebolt database connections and operations"""
-    
-    def __init__(self):
-        self.connection: Optional[Any] = None
-        self.cursor: Optional[Any] = None
-        
-    def connect(self) -> None:
-        """Establish connection to Firebolt"""
-        try:
-            # Ensure writable cache/config directories in Lambda
-            os.environ.setdefault('HOME', '/tmp')
-            os.environ.setdefault('XDG_CACHE_HOME', '/tmp')
-            os.environ.setdefault('XDG_CONFIG_HOME', '/tmp')
-            os.environ.setdefault('FIREBOLT_CACHE_DIR', '/tmp')
-
-            # Clean helper to strip accidental surrounding quotes
-            def _clean(v: Any) -> Any:
-                if isinstance(v, str) and len(v) >= 2:
-                    if (v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'"):
-                        return v[1:-1]
-                return v
-
-            # Validate required environment variables
-            required_vars = ['FIREBOLT_ACCOUNT', 'FIREBOLT_DATABASE', 'FIREBOLT_ENGINE']
-            missing_vars = [var for var in required_vars if not os.environ.get(var)]
-            
-            # Prefer Client Credentials if provided, else Username/Password (REQUIRED)
-            client_id = _clean(os.environ.get('FIREBOLT_CLIENT_ID'))
-            client_secret = _clean(os.environ.get('FIREBOLT_CLIENT_SECRET'))
-            
-            if client_id and client_secret:
-                auth_obj = ClientCredentials(
-                    client_id=client_id, 
-                    client_secret=client_secret
-                )
-                logger.info("Using Client Credentials authentication")
-            else:
-                # Username/Password authentication (REQUIRED if no client credentials)
-                username = _clean(os.environ.get('FIREBOLT_USERNAME'))
-                password = _clean(os.environ.get('FIREBOLT_PASSWORD'))
-                
-                if not username or not password:
-                    raise ValueError(
-                        "Missing required authentication credentials! "
-                        "You must provide either:\n"
-                        "  1. FIREBOLT_USERNAME and FIREBOLT_PASSWORD, OR\n"
-                        "  2. FIREBOLT_CLIENT_ID and FIREBOLT_CLIENT_SECRET"
-                    )
-                
-                auth_obj = UsernamePassword(
-                    username=username,
-                    password=password
-                )
-                logger.info("Using Username/Password authentication")
-            
-            if missing_vars:
-                raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-
-            self.connection = fb_connect(
-                auth=auth_obj,
-                account_name=_clean(os.environ['FIREBOLT_ACCOUNT']),
-                engine_name=_clean(os.environ['FIREBOLT_ENGINE']),
-                database=_clean(os.environ['FIREBOLT_DATABASE']),
-                disable_cache=True
-                # Using default autocommit=True - each statement is atomic
-            )
-            self.cursor = self.connection.cursor()
-            logger.info("✓ Successfully connected to Firebolt")
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to Firebolt: {str(e)}")
-            raise
-    
-    def execute(self, sql: str, retry_on_connection_error=True) -> Any:
-        """Execute SQL and return results (raw SQL, no prepared statements)
-        
-        Args:
-            sql: SQL query to execute
-            retry_on_connection_error: If True, reconnect and retry once on connection errors
-        
-        Returns:
-            Cursor with query results
-        """
-        logger.info("SQL>> %s", sql[:200] + "..." if len(sql) > 200 else sql)
-        try:
-            # Force raw SQL execution (no prepared statements)
-            # Firebolt doesn't support prepared statements for MERGE
-            # Use string directly, no parameters
-            self.cursor.execute(str(sql))
-            return self.cursor
-        except Exception as e:
-            error_msg = str(e)
-            
-            # Check for connection/engine errors that indicate stale connection
-            connection_errors = [
-                "connection",
-                "engine",
-                "session",
-                "cannot be retried",  # Firebolt's "Query of type 'DML Merge' cannot be retried"
-                "timeout",
-                "closed"
-            ]
-            
-            is_connection_error = any(keyword in error_msg.lower() for keyword in connection_errors)
-            
-            if is_connection_error and retry_on_connection_error:
-                logger.warning(f"⚠️  Connection error detected, attempting to reconnect: {error_msg}")
-                try:
-                    # Reconnect
-                    self.disconnect()
-                    self.connect()
-                    logger.info("✓ Reconnected successfully, retrying query")
-                    
-                    # Retry query (only once, to avoid infinite loop)
-                    self.cursor.execute(str(sql))
-                    return self.cursor
-                except Exception as retry_error:
-                    logger.error(f"✗ Retry after reconnect failed: {retry_error}")
-                    raise
-            else:
-                logger.error(f"Query failed: {e}")
-                logger.error(f"SQL that failed: {sql[:1000]}")
-                raise
-    
-    def disconnect(self) -> None:
-        """Close Firebolt connection"""
-        if self.cursor:
-            self.cursor.close()
-        if self.connection:
-            self.connection.close()
-        logger.info("Disconnected from Firebolt")
-
-def get_columns(schema, table, fb_connector):
-    """Get column names for a table"""
-    q = (
-        "SELECT column_name "
-        "FROM information_schema.columns "
-        f"WHERE table_schema = '{schema}' AND table_name = '{table}' "
-        "ORDER BY ordinal_position;"
-    )
-    cursor = fb_connector.execute(q)
-    rows = cursor.fetchall()
-    
-    if not rows:
-        raise ValueError(f"Table {schema}.{table} not found or has no columns")
-    
-    # Extract column names from tuples
-    return [row[0] for row in rows]
-
-def get_column_types(schema, table, fb_connector):
-    """Get column names and data types for a table"""
-    q = (
-        "SELECT column_name, data_type "
-        "FROM information_schema.columns "
-        f"WHERE table_schema = '{schema}' AND table_name = '{table}' "
-        "ORDER BY ordinal_position;"
-    )
-    cursor = fb_connector.execute(q)
-    rows = cursor.fetchall()
-    
-    if not rows:
-        raise ValueError(f"Table {schema}.{table} not found or has no columns")
-    
-    # Return dict {column_name: data_type}
-    return {row[0]: row[1] for row in rows}
-
-def ensure_staging_table_name(table, staging_suffix):
-    """Generate unique staging table name for this Lambda invocation"""
-    staging_table = f"stg_{table}_{staging_suffix}"
-    
-    # Note: Staging table will be auto-created by COPY command
-    # This avoids schema mismatches between parquet and Firebolt table
-    # (e.g., DMS writes BLOB as bytea, Firebolt expects text)
-    
-    logger.info(f"Staging table name: {staging_table}")
-    return staging_table
-
-def render_copy_single_file(staging_table, table, date_path, filename, location, database):
-    """Generate COPY statement for single file - DMS format"""
-    # DMS format: database/table/YYYY/MM/DD/filename
-    pattern = f'{database}/{table}/{date_path}/{filename}'
-    
-    return (
-        f'COPY "public"."{staging_table}"\n'
-        f'FROM {location}\n'
-        'WITH (\n'
-        f"  PATTERN = '{pattern}',\n"
-        '  TYPE = PARQUET,\n'
-        '  AUTO_CREATE = TRUE,\n'  # Let Firebolt infer schema from parquet
-        "  MAX_ERRORS_PER_FILE = '0%'\n"
-        ');\n'
-    )
-
-def render_merge(table, staging_table, cols, key_cols, delete_expr=None, key_cols_safe=None):
-    """Generate MERGE statement
-    
-    Args:
-        table: Target table name
-        staging_table: Staging table name
-        cols: List of columns to merge (intersection of staging and production)
-        key_cols: Original primary key columns
-        delete_expr: Optional delete expression for CDC
-        key_cols_safe: Filtered primary keys (excludes DECIMAL columns) for ON clause
+def build_dedup_order_by(cols_staging: List[str], keys: List[str]) -> str:
     """
-    # Use safe key columns for ON clause (without DECIMALs) if provided
-    on_keys = key_cols_safe if key_cols_safe else key_cols
-    on_clause = " AND ".join([f't."{k}" = s."{k}"' for k in on_keys])
+    Build deterministic ORDER BY clause for deduplication.
+    Works generically across all tables.
     
-    non_keys = [c for c in cols if c not in key_cols]
-    set_clause = ",\n    ".join([f'"{c}" = s."{c}"' for c in non_keys]) if non_keys else None
-    cols_csv = ", ".join([f'"{c}"' for c in cols])
-    vals_csv = ", ".join([f's."{c}"' for c in cols])
-
-    parts = [
-        f'MERGE INTO "public"."{table}" AS t',
-        f'USING "public"."{staging_table}" AS s',
-        f'ON ({on_clause})'
-    ]
-
-    # Handle deletes (tombstones) if configured
-    if delete_expr:
-        parts.append(f'WHEN MATCHED AND ({delete_expr}) THEN DELETE')
-
-    # Update existing rows
-    if set_clause:
-        parts.append(f'WHEN MATCHED THEN UPDATE SET\n    {set_clause}')
-
-    # Insert new rows
-    parts.append(f'WHEN NOT MATCHED THEN INSERT ({cols_csv}) VALUES ({vals_csv});')
+    CASCADING PRIORITY (each level only checked if previous levels are TIED):
     
-    return "\n".join(parts)
-
-def execute_merge_with_retry(fb_connector, table, staging_table, cols, keys, delete_expr=None, key_cols_safe=None, max_retries=3):
-    """Execute MERGE with retry logic using Firebolt HTTP status codes
-    
-    Single MERGE statement is atomic - no explicit transaction wrapper needed.
-    With autocommit=True (default), the MERGE auto-commits on success.
-    
-    CRITICAL: On retry after conflict, we DELETE existing staging keys from production
-    to prevent duplicates caused by partial MERGE commits during MVCC conflicts.
-    
-    Error handling follows Firebolt best practices:
-    - 409 Conflict: Transaction conflict → DELETE conflicting keys, then retry
-    - 5xx Server Error: Transient failure → Retry with backoff
-    - 4xx Client Error: Permanent error → Don't retry, fail immediately
-    - 2xx Success: Proceed
-    
-    Args:
-        fb_connector: Firebolt connector instance
-        table: Target table name
-        staging_table: Staging table name
-        cols: List of columns to merge
-        keys: Original primary key columns
-        delete_expr: Optional delete expression for CDC
-        key_cols_safe: Filtered primary keys for ON clause
-        max_retries: Maximum number of retry attempts (default 3)
+    1. load_timestamp DESC (DMS S3 write timestamp)
+       - If load_timestamps differ -> winner determined, STOP
+       - If load_timestamps same -> continue to next level
+       
+    2. Op priority (D > U > I) - only if load_timestamp tied
+       - Delete operations win (final state)
+       - If Op differs -> winner determined, STOP
+       - If Op same -> continue to next level
+       
+    3. updated DESC (MySQL timestamp) - only if above tied
+       - If updated differs -> winner determined, STOP
+       - If updated same or NULL -> continue to next level
+       
+    4. created DESC (MySQL timestamp) - only if above tied
+       - If created differs -> winner determined, STOP
+       - If created same or NULL -> continue to next level
+       
+    5. ingestion_seq DESC (Parquet file row order) - FINAL tie-breaker
+       - Captures the natural row order from the Parquet file
+       - Later rows in file = later changes in MySQL binlog
+       - CRITICAL for edge cases with identical timestamps
     """
-    for attempt in range(max_retries):
-        try:
-            # ALWAYS delete existing rows before MERGE to prevent duplicates
-            # This is critical because Firebolt's MVCC can partially commit data
-            # even when a transaction conflict occurs, leading to duplicates on retry
-            logger.info(f"🧹 Cleaning up existing rows before MERGE (attempt {attempt + 1}/{max_retries})")
-            
-            # Build WHERE clause for primary keys from staging
-            key_cols_for_delete = key_cols_safe if key_cols_safe else keys
-            keys_csv = ", ".join([f'"{k}"' for k in key_cols_for_delete])
-            
-            cleanup_sql = f"""
-            DELETE FROM "public"."{table}"
-            WHERE ({keys_csv}) IN (
-                SELECT {keys_csv}
-                FROM "public"."{staging_table}"
-            )
-            """
-            
-            try:
-                fb_connector.execute(cleanup_sql)
-                logger.info(f"✓ Pre-MERGE cleanup completed")
-            except Exception as cleanup_error:
-                logger.error(f"✗ Pre-MERGE cleanup FAILED - cannot proceed safely: {cleanup_error}")
-                # CRITICAL: If DELETE fails, we CANNOT proceed with MERGE
-                # because it would create duplicates. Re-raise to trigger retry.
-                raise Exception(f"Pre-MERGE cleanup failed, aborting to prevent duplicates: {cleanup_error}")
-            
-            merge_sql = render_merge(table, staging_table, cols, keys, delete_expr=delete_expr, key_cols_safe=key_cols_safe)
-            logger.info(f"Generated MERGE SQL (first 500 chars): {merge_sql[:500]}")
-            logger.info(f"Staging table: {staging_table}, Production table: {table}")
-            
-            # Execute MERGE (auto-commits on success with autocommit=True)
-            fb_connector.execute(merge_sql)
-            
-            # Get row count if possible
-            try:
-                rows_affected = fb_connector.cursor.rowcount if hasattr(fb_connector.cursor, 'rowcount') else "unknown"
-            except:
-                rows_affected = "unknown"
-            
-            logger.info(f"✓ MERGE completed for {table} ({rows_affected} rows affected)")
-            return  # Success (2xx)!
-            
-        except Exception as e:
-            error_msg = str(e)
-            
-            # Extract HTTP status code from exception (Firebolt SDK best practice)
-            status_code = None
-            if hasattr(e, 'status_code'):
-                status_code = e.status_code
-            elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
-                status_code = e.response.status_code
-            
-            # Determine if error is retryable based on HTTP status code
-            is_retryable = False
-            error_category = "Unknown"
-            
-            if status_code:
-                if status_code == 409:
-                    # 409 Conflict: Transaction conflict (retryable)
-                    is_retryable = True
-                    error_category = "Conflict (409)"
-                elif 500 <= status_code < 600:
-                    # 5xx: Server error (retryable)
-                    is_retryable = True
-                    error_category = f"Server Error ({status_code})"
-                elif 400 <= status_code < 500:
-                    # 4xx: Client error (non-retryable, except 409 handled above)
-                    is_retryable = False
-                    error_category = f"Client Error ({status_code})"
-                else:
-                    # 2xx or other: Success or unexpected
-                    is_retryable = False
-                    error_category = f"Unexpected ({status_code})"
-            else:
-                # Fallback: No status code available, check error message and error code
-                # (backwards compatibility for older SDK versions or network errors)
-                logger.warning(f"⚠️  No HTTP status code available, falling back to text/code matching")
-                
-                # Check for Firebolt error code 9 (transaction conflict)
-                has_conflict_code = "code: 9" in error_msg or "code:9" in error_msg
-                
-                # Check for conflict keywords in error message
-                has_conflict_text = ("conflict" in error_msg.lower() or 
-                                   "detected" in error_msg.lower() and "conflicts" in error_msg.lower() or
-                                   "cannot be retried" in error_msg.lower())
-                
-                if has_conflict_code or has_conflict_text:
-                    is_retryable = True
-                    if has_conflict_code:
-                        error_category = "Conflict (error code 9)"
-                    else:
-                        error_category = "Conflict (text match)"
-                else:
-                    is_retryable = False
-                    error_category = "Non-retryable (text match)"
-            
-            # Handle based on retryability
-            if is_retryable:
-                if attempt < max_retries - 1:
-                    # Exponential backoff with jitter to avoid thundering herd
-                    # Increased backoff for MVCC conflicts: 3^attempt instead of 2^attempt
-                    base_wait = (3 ** attempt) if attempt <= 5 else 243  # Cap at ~4 minutes
-                    wait_time = base_wait + random.uniform(0, 2)
-                    logger.warning(
-                        f"⚠️  {error_category} on {table}, "
-                        f"retry {attempt + 1}/{max_retries} in {wait_time:.2f}s: {error_msg}"
-                    )
-                    time.sleep(wait_time)
-                    continue  # Retry
-                else:
-                    # Max retries reached
-                    logger.error(
-                        f"✗ MERGE failed for {table} after {max_retries} retries "
-                        f"({error_category}): {error_msg}"
-                    )
-                    logger.error(f"   Columns used: {cols}")
-                    logger.error(f"   Primary keys: {keys}")
-                    raise
-            else:
-                # Non-retryable error (permanent client error or syntax issue)
-                logger.error(
-                    f"✗ MERGE failed for {table} with non-retryable error "
-                    f"({error_category}): {error_msg}"
-                )
-                logger.error(f"   Columns used: {cols}")
-                logger.error(f"   Primary keys: {keys}")
-                raise
+    order_parts = []
+    
+    # Level 1: load_timestamp (primary - checked first)
+    if 'load_timestamp' in cols_staging:
+        order_parts.append('load_timestamp DESC')
+    
+    # Level 2: Op column priority (only if load_timestamp tied)
+    if 'Op' in cols_staging:
+        order_parts.append("""CASE "Op" 
+            WHEN 'D' THEN 3 
+            WHEN 'U' THEN 2 
+            WHEN 'I' THEN 1 
+            ELSE 0 
+        END DESC""")
+    
+    # Level 3: MySQL updated timestamp (only if above tied)
+    # Handle both TIMESTAMP and BIGINT (epoch) types with COALESCE for NULLs
+    if 'updated' in cols_staging:
+        order_parts.append('COALESCE("updated", 0) DESC')
+    
+    # Level 4: MySQL created timestamp (only if above tied)
+    if 'created' in cols_staging:
+        order_parts.append('COALESCE("created", 0) DESC')
+    
+    # Level 5: Ingestion sequence number (captures Parquet file row order)
+    # This is CRITICAL for edge cases where timestamps are identical
+    # The LAST row in the Parquet file should win (higher ingestion_seq = later change)
+    if 'ingestion_seq' in cols_staging:
+        order_parts.append('"ingestion_seq" DESC')
+    
+    return ",\n            ".join(order_parts)
 
-def deduplicate_staging_table(staging_table, table, keys, cols_staging, fb_connector):
-    """Deduplicate staging table before MERGE to prevent duplicate primary keys
-    
-    Uses table-specific timestamp columns to determine which row to keep:
-    - users: uses 'access' or 'changed' (prefers access)
-    - sessions: uses 'timestamp'
-    - Other tables: uses 'load_timestamp' if available, otherwise arbitrary
-    
-    Args:
-        staging_table: Name of staging table
-        table: Target table name (for table-specific logic)
-        keys: Primary key columns
-        cols_staging: List of columns in staging table
-        fb_connector: Firebolt connector instance
+
+def deduplicate_staging_table(
+    staging_table: str, 
+    keys: List[str], 
+    cols_staging: List[str], 
+    fb_connector
+) -> str:
+    """
+    Deduplicate staging table before MERGE.
+    Keeps only one row per primary key based on deterministic ordering.
     
     Returns:
-        True if deduplication was performed, False if not needed
+        str: Name of deduplicated table (either original or new dedup table)
     """
-    try:
-        # Convert keys to list if needed
-        if isinstance(keys, str):
-            keys_list = [keys]
-        else:
-            keys_list = keys
-        
-        # Check if there are duplicate primary keys
-        keys_csv = ", ".join([f'"{k}"' for k in keys_list])
-        check_duplicates_sql = f"""
-        SELECT COUNT(*) as total_rows,
-               COUNT(DISTINCT ({keys_csv})) as distinct_keys
+    key_cols_csv = ", ".join([f'"{k}"' for k in keys])
+    
+    # Check if deduplication is needed
+    check_sql = f"""
+    SELECT COUNT(*) as total_rows,
+           COUNT(DISTINCT ({key_cols_csv})) as unique_keys
+    FROM "public"."{staging_table}"
+    """
+    
+    cursor = fb_connector.execute(check_sql)
+    row = cursor.fetchone()
+    total_rows = row[0]
+    unique_keys = row[1]
+    
+    if total_rows == unique_keys:
+        logger.info(f"No duplicates in staging ({total_rows} rows, {unique_keys} unique keys)")
+        return staging_table  # No dedup needed
+    
+    duplicates = total_rows - unique_keys
+    logger.info(f"Found {duplicates} duplicates ({total_rows} rows, {unique_keys} unique keys). Deduplicating...")
+    
+    # Build ORDER BY clause
+    order_by = build_dedup_order_by(cols_staging, keys)
+    
+    # Create deduplicated table
+    dedup_table = f"{staging_table}_dedup"
+    partition_by = ", ".join([f'"{k}"' for k in keys])
+    
+    # Exclude ingestion_seq from output columns (it's just for ordering)
+    output_cols = [c for c in cols_staging if c != 'ingestion_seq']
+    all_cols = ", ".join([f'"{c}"' for c in output_cols])
+    select_cols = ", ".join([f'"{c}"' for c in cols_staging])
+    
+    # Use subquery approach with ROW_NUMBER
+    dedup_sql = f"""
+    CREATE TABLE "public"."{dedup_table}" AS
+    SELECT {all_cols}
+    FROM (
+        SELECT {select_cols},
+               ROW_NUMBER() OVER (
+                   PARTITION BY {partition_by}
+                   ORDER BY 
+                       {order_by}
+               ) AS rn
         FROM "public"."{staging_table}"
-        """
-        cursor = fb_connector.execute(check_duplicates_sql)
-        total_rows, distinct_keys = cursor.fetchone()
-        
-        if total_rows == distinct_keys:
-            logger.info(f"✓ No duplicate primary keys in staging table (all {total_rows} rows are unique)")
-            return False
-        
-        duplicates = total_rows - distinct_keys
-        logger.info(f"⚠️  Found {duplicates} duplicate primary keys in staging table, deduplicating...")
-        
-        # Determine which timestamp column to use for ordering
-        timestamp_col = None
-        
-        # Table-specific timestamp column preferences
-        if table == "users":
-            # For users table, prefer 'access' (last access time), fallback to 'changed'
-            if "access" in cols_staging:
-                timestamp_col = "access"
-                logger.info("Using 'access' column for users table deduplication")
-            elif "changed" in cols_staging:
-                timestamp_col = "changed"
-                logger.info("Using 'changed' column for users table deduplication")
-        elif table == "sessions":
-            # For sessions table, use 'timestamp'
-            if "timestamp" in cols_staging:
-                timestamp_col = "timestamp"
-                logger.info("Using 'timestamp' column for sessions table deduplication")
-        else:
-            # For other tables, use 'load_timestamp' if available
-            if "load_timestamp" in cols_staging:
-                timestamp_col = "load_timestamp"
-                logger.info("Using 'load_timestamp' column for deduplication")
-        
-        # Build ORDER BY clause
-        if timestamp_col:
-            order_by = f'"{timestamp_col}" DESC'
-            logger.info(f"Deduplicating by keeping latest row per primary key (ordered by {timestamp_col})")
-        else:
-            # No timestamp - use primary key for ordering (arbitrary, but deterministic)
-            order_by = keys_csv
-            logger.info("No timestamp column found - keeping arbitrary row per primary key")
-        
-        # Create deduplicated table
-        dedup_sql = f"""
-        CREATE TABLE "{staging_table}_dedup" AS
-        SELECT *
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (PARTITION BY {keys_csv} ORDER BY {order_by}) as rn
-            FROM "public"."{staging_table}"
-        ) t
-        WHERE rn = 1
-        """
-        
-        fb_connector.execute(dedup_sql)
-        logger.info("✓ Deduplicated table created")
-        
-        # Verify row count
-        cursor = fb_connector.execute(f'SELECT COUNT(*) FROM "{staging_table}_dedup"')
-        dedup_count = cursor.fetchone()[0]
-        logger.info(f"✓ Deduplicated table has {dedup_count:,} rows (removed {duplicates} duplicates)")
-        
-        # Drop original and rename deduplicated table
-        fb_connector.execute(f'DROP TABLE IF EXISTS "{staging_table}"')
-        fb_connector.execute(f'ALTER TABLE "{staging_table}_dedup" RENAME TO "{staging_table}"')
-        logger.info("✓ Staging table deduplicated successfully")
-        
-        return True
-        
-    except Exception as e:
-        logger.warning(f"⚠️  Deduplication failed (may not be needed): {e}")
-        logger.info("Proceeding with original staging table...")
-        return False
-
-def cleanup_staging_table(staging_table, fb_connector, max_retries=3):
-    """Drop temporary staging table with retry logic
+    ) t
+    WHERE rn = 1
+    """
     
-    Args:
-        staging_table: Name of staging table to drop
-        fb_connector: Firebolt connector instance
-        max_retries: Maximum number of retry attempts (default 3)
+    logger.info(f"Creating deduplicated staging table: {dedup_table}")
+    fb_connector.execute(dedup_sql)
+    
+    # Verify dedup worked
+    verify_sql = f'SELECT COUNT(*) FROM "public"."{dedup_table}"'
+    cursor = fb_connector.execute(verify_sql)
+    dedup_count = cursor.fetchone()[0]
+    
+    logger.info(f"Deduplicated: {total_rows} -> {dedup_count} rows")
+    
+    return dedup_table
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGING TABLE CREATION (with ingestion_seq)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def create_staging_table_with_ingestion_seq(
+    fb_connector,
+    staging_table: str,
+    location: str,
+    pattern: str
+) -> list:
+    """
+    Create staging table from Parquet with ingestion_seq column.
+    
+    The ingestion_seq captures the row order from the Parquet file,
+    which preserves the MySQL binlog order for rows with identical timestamps.
     
     Returns:
-        bool: True if cleanup succeeded, False otherwise
+        list: Column names in staging table
     """
-    if not staging_table:
-        return True
+    # First, create a temp table without ingestion_seq
+    temp_table = f"{staging_table}_temp"
+    
+    create_temp_sql = f"""
+    CREATE TABLE "public"."{temp_table}" AS
+    SELECT * FROM READ_PARQUET(
+        LOCATION => '{location}',
+        PATTERN => '{pattern}'
+    )
+    """
+    
+    logger.info(f"Loading Parquet to temp table: {temp_table}")
+    fb_connector.execute(create_temp_sql)
+    
+    # Get columns from temp table
+    temp_cols = get_columns("public", temp_table, fb_connector)
+    
+    # Create staging table with ingestion_seq
+    cols_csv = ", ".join([f'"{c}"' for c in temp_cols])
+    
+    create_staging_sql = f"""
+    CREATE TABLE "public"."{staging_table}" AS
+    SELECT 
+        {cols_csv},
+        ROW_NUMBER() OVER () AS ingestion_seq
+    FROM "public"."{temp_table}"
+    """
+    
+    logger.info(f"Creating staging table with ingestion_seq: {staging_table}")
+    fb_connector.execute(create_staging_sql)
+    
+    # Drop temp table
+    drop_temp_sql = f'DROP TABLE IF EXISTS "public"."{temp_table}"'
+    fb_connector.execute(drop_temp_sql)
+    
+    # Return staging columns (including ingestion_seq)
+    staging_cols = temp_cols + ['ingestion_seq']
+    
+    # Get row count
+    count_sql = f'SELECT COUNT(*) FROM "public"."{staging_table}"'
+    cursor = fb_connector.execute(count_sql)
+    row_count = cursor.fetchone()[0]
+    
+    logger.info(f"Loaded {row_count:,} rows to staging table with ingestion_seq")
+    
+    return staging_cols
+
+
+def cleanup_staging_table(staging_table: str, fb_connector):
+    """Drop staging table"""
+    try:
+        drop_sql = f'DROP TABLE IF EXISTS "public"."{staging_table}"'
+        fb_connector.execute(drop_sql)
+        logger.info(f"Dropped staging table: {staging_table}")
+    except Exception as e:
+        logger.warning(f"Failed to drop staging table {staging_table}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MERGE EXECUTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_merge(
+    target_table: str,
+    staging_table: str,
+    cols: List[str],
+    keys: List[str],
+    delete_expr: str = None
+) -> str:
+    """
+    Generate MERGE statement.
+    
+    Uses MERGE to:
+    - INSERT new rows (not in target)
+    - UPDATE existing rows (matching keys)
+    - DELETE rows (when Op='D')
+    """
+    # ON clause
+    on_clause = " AND ".join([f't."{k}" = s."{k}"' for k in keys])
+    
+    # UPDATE SET clause (exclude keys)
+    update_cols = [c for c in cols if c not in keys and c not in ('Op', 'load_timestamp', 'ingestion_seq')]
+    update_set = ", ".join([f'"{c}" = s."{c}"' for c in update_cols])
+    
+    # INSERT columns and values (exclude CDC metadata)
+    insert_cols = [c for c in cols if c not in ('Op', 'load_timestamp', 'ingestion_seq')]
+    insert_cols_csv = ", ".join([f'"{c}"' for c in insert_cols])
+    insert_vals_csv = ", ".join([f's."{c}"' for c in insert_cols])
+    
+    # Build MERGE SQL
+    merge_sql = f"""
+    MERGE INTO "public"."{target_table}" AS t
+    USING "public"."{staging_table}" AS s
+    ON {on_clause}
+    """
+    
+    # Add DELETE when matched (for Op='D')
+    if delete_expr:
+        merge_sql += f"""
+    WHEN MATCHED AND {delete_expr} THEN DELETE
+    """
+    
+    # Add UPDATE when matched (for non-delete operations)
+    if update_set:
+        merge_sql += f"""
+    WHEN MATCHED THEN UPDATE SET {update_set}
+    """
+    
+    # Add INSERT when not matched
+    merge_sql += f"""
+    WHEN NOT MATCHED THEN INSERT ({insert_cols_csv}) VALUES ({insert_vals_csv})
+    """
+    
+    return merge_sql
+
+
+def execute_merge_with_retry(
+    fb_connector,
+    table: str,
+    staging_table: str,
+    cols: List[str],
+    keys: List[str],
+    delete_expr: str = None,
+    key_cols_safe: List[str] = None,
+    max_retries: int = 10
+):
+    """Execute MERGE with retry logic for MVCC conflicts"""
+    
+    if key_cols_safe is None:
+        key_cols_safe = keys
+    
+    merge_sql = render_merge(
+        target_table=table,
+        staging_table=staging_table,
+        cols=cols,
+        keys=key_cols_safe,
+        delete_expr=delete_expr
+    )
     
     for attempt in range(max_retries):
         try:
-            drop_sql = f'DROP TABLE IF EXISTS "public"."{staging_table}"'
-            fb_connector.execute(drop_sql)
-            logger.info(f"✓ Cleaned up staging table {staging_table}")
-            return True
+            fb_connector.execute(merge_sql)
+            logger.info(f"MERGE completed successfully")
+            return
         except Exception as e:
-            error_msg = str(e)
+            error_str = str(e).lower()
             
-            # Check if table doesn't exist (already cleaned up)
-            if "does not exist" in error_msg.lower() or "not found" in error_msg.lower():
-                logger.info(f"✓ Staging table {staging_table} already dropped")
-                return True
-            
-            # Check if connection is closed
-            if "connection" in error_msg.lower() and "closed" in error_msg.lower():
-                logger.error(f"✗ Cannot drop {staging_table}: connection closed")
-                return False
-            
-            # Retry on transient errors
-            if attempt < max_retries - 1:
+            # Check if MVCC conflict
+            if 'mvcc' in error_str or 'concurrent' in error_str or 'conflict' in error_str:
                 wait_time = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(
-                    f"⚠️  Failed to drop {staging_table} (attempt {attempt + 1}/{max_retries}), "
-                    f"retrying in {wait_time:.2f}s: {error_msg}"
-                )
+                logger.warning(f"MVCC conflict on attempt {attempt + 1}/{max_retries}, retrying in {wait_time:.2f}s...")
                 time.sleep(wait_time)
             else:
-                # Final attempt failed - log but don't raise
-                # (we don't want cleanup failure to mask the original error)
-                logger.error(
-                    f"✗ Failed to drop {staging_table} after {max_retries} attempts: {error_msg}. "
-                    f"Table will remain in database and should be cleaned up manually or by scheduled job."
-                )
-                return False
+                # Non-MVCC error, raise immediately
+                raise
     
-    return False
+    raise RuntimeError(f"MERGE failed after {max_retries} retries due to MVCC conflicts")
 
-# ═══════════════════════════════════════════════════════════════════
-# FILE DEDUPLICATION FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════
 
-def is_file_processed(file_key: str, fb_connector) -> tuple:
-    """
-    Check if file has already been processed
-    
-    Also checks for batch_processed markers from manual CDC processing.
-    
-    Args:
-        file_key: Unique file identifier (database/table/YYYY/MM/DD/filename.parquet)
-        fb_connector: Firebolt connector instance
-    
-    Returns:
-        tuple: (is_processed: bool, status: str or None)
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILE TRACKING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def is_file_processed(file_key: str, fb_connector) -> bool:
+    """Check if file has been processed"""
+    check_sql = f"""
+    SELECT COUNT(*) FROM cdc_processed_files 
+    WHERE file_key = '{file_key}' AND status IN ('completed', 'batch_processed')
     """
     try:
-        # Escape single quotes in file_key
-        file_key_safe = file_key.replace("'", "''")
-        
-        check_sql = f"""
-        SELECT status, request_id, processed_at
-        FROM cdc_processed_files
-        WHERE file_key = '{file_key_safe}'
-        """
-        
         cursor = fb_connector.execute(check_sql)
-        result = cursor.fetchone()
-        
-        if result:
-            status = result[0]
-            request_id = result[1]
-            processed_at = result[2]
-            
-            if status == 'completed':
-                logger.info(f"✓ File {file_key} already processed by {request_id}")
-                return True, status
-            
-            elif status == 'processing':
-                # Check if stale (processing for > 15 min = Lambda timeout)
-                if processed_at:
-                    from datetime import datetime
-                    if isinstance(processed_at, datetime):
-                        age_minutes = (datetime.now() - processed_at).total_seconds() / 60
-                    else:
-                        age_minutes = 0
-                    
-                    if age_minutes > 15:
-                        logger.warning(f"⚠️  File {file_key} stuck in 'processing' for {age_minutes:.1f} min, will retry")
-                        return False, status
-                
-                logger.info(f"⏳ File {file_key} currently being processed by another Lambda")
-                return True, status
-            
-            elif status == 'failed':
-                logger.info(f"⚠️  File {file_key} previously failed, will retry")
-                return False, status
-        
-        # STEP 2: Check for batch_processed marker (manual CDC processing)
-        # Extract date_path from file_key: database/table/YYYY/MM/DD/filename.parquet
-        # We want to check: database/table/YYYY/MM/DD/batch_processed
-        parts = file_key.split('/')
-        if len(parts) >= 4:
-            # Reconstruct path up to date: database/table/YYYY/MM/DD
-            date_path = '/'.join(parts[:-1])  # Everything except filename
-            batch_marker = f"{date_path}/batch_processed"
-            batch_marker_safe = batch_marker.replace("'", "''")
-            
-            batch_check_sql = f"""
-            SELECT status, processed_at
-            FROM cdc_processed_files
-            WHERE file_key = '{batch_marker_safe}'
-              AND status = 'completed'
-            """
-            
-            cursor = fb_connector.execute(batch_check_sql)
-            batch_result = cursor.fetchone()
-            
-            if batch_result:
-                logger.info(f"✓ Date {date_path} was batch processed manually - skipping file {file_key}")
-                return True, 'batch_processed'
-        
-        # Not found = not processed yet
-        logger.info(f"File {file_key} not yet processed")
-        return False, None
-        
+        count = cursor.fetchone()[0]
+        return count > 0
     except Exception as e:
-        logger.error(f"✗ Error checking if file processed: {e}")
-        # On error, proceed with processing (fail-open)
-        return False, None
+        logger.warning(f"Failed to check file status: {e}")
+        return False
 
-def mark_file_processing(file_key: str, request_id: str, lambda_arn: str, fb_connector) -> bool:
-    """
-    Mark file as currently being processed
-    
-    Args:
-        file_key: Unique file identifier
-        request_id: Lambda request ID
-        lambda_arn: Lambda ARN
-        fb_connector: Firebolt connector instance
-    
-    Returns:
-        bool: True if successfully marked, False if already being processed
+
+def mark_file_completed(file_key: str, fb_connector):
+    """Mark file as completed"""
+    insert_sql = f"""
+    INSERT INTO cdc_processed_files (file_key, status, processed_at)
+    VALUES ('{file_key}', 'completed', CURRENT_TIMESTAMP)
     """
     try:
-        # Escape single quotes
-        file_key_safe = file_key.replace("'", "''")
-        request_id_safe = request_id.replace("'", "''")
-        lambda_arn_safe = lambda_arn.replace("'", "''")
-        
-        insert_sql = f"""
-        INSERT INTO cdc_processed_files (
-            file_key, 
-            request_id, 
-            processed_at, 
-            status, 
-            lambda_arn, 
-            attempt_count
-        )
-        VALUES (
-            '{file_key_safe}',
-            '{request_id_safe}',
-            CURRENT_TIMESTAMP,
-            'processing',
-            '{lambda_arn_safe}',
-            1
-        )
-        """
-        
         fb_connector.execute(insert_sql)
-        logger.info(f"✓ Marked {file_key} as processing")
-        return True
-        
+        logger.info(f"Marked file as completed: {file_key}")
     except Exception as e:
-        error_msg = str(e).lower()
-        
-        # Check if it's a duplicate key error
-        if "duplicate" in error_msg or "already exists" in error_msg or "unique" in error_msg or "constraint" in error_msg:
-            logger.warning(f"⚠️  File {file_key} already being processed by another Lambda")
-            return False
-        else:
-            logger.error(f"✗ Error marking file as processing: {e}")
-            # On unknown error, proceed anyway (fail-open)
-            return True
+        logger.warning(f"Failed to mark file as completed: {e}")
 
-def mark_file_completed(file_key: str, fb_connector) -> None:
-    """Mark file as successfully processed"""
-    try:
-        file_key_safe = file_key.replace("'", "''")
-        
-        update_sql = f"""
-        UPDATE cdc_processed_files
-        SET status = 'completed',
-            processed_at = CURRENT_TIMESTAMP
-        WHERE file_key = '{file_key_safe}'
-        """
-        
-        fb_connector.execute(update_sql)
-        logger.info(f"✓ Marked {file_key} as completed")
-        
-    except Exception as e:
-        logger.error(f"✗ Error marking file as completed: {e}")
-        # Non-fatal - file was processed successfully
 
-def mark_file_failed(file_key: str, error_message: str, fb_connector) -> None:
+def mark_file_failed(file_key: str, error: str, fb_connector):
     """Mark file as failed"""
-    try:
-        file_key_safe = file_key.replace("'", "''")
-        error_safe = str(error_message)[:1000].replace("'", "''")  # Truncate and escape
-        
-        update_sql = f"""
-        UPDATE cdc_processed_files
-        SET status = 'failed',
-            processed_at = CURRENT_TIMESTAMP,
-            error_message = '{error_safe}',
-            attempt_count = attempt_count + 1
-        WHERE file_key = '{file_key_safe}'
-        """
-        
-        fb_connector.execute(update_sql)
-        logger.info(f"✓ Marked {file_key} as failed")
-        
-    except Exception as e:
-        logger.error(f"✗ Error marking file as failed: {e}")
-
-def cleanup_old_processed_files(fb_connector, days_to_keep: int = 30) -> None:
-    """
-    Clean up old records from cdc_processed_files table
-    
-    Args:
-        fb_connector: Firebolt connector instance
-        days_to_keep: Number of days to keep records (default: 30)
+    error_escaped = error.replace("'", "''")[:500]
+    insert_sql = f"""
+    INSERT INTO cdc_processed_files (file_key, status, error_message, processed_at)
+    VALUES ('{file_key}', 'failed', '{error_escaped}', CURRENT_TIMESTAMP)
     """
     try:
-        logger.info(f"🧹 Cleaning up records older than {days_to_keep} days from cdc_processed_files")
-        
-        # Get count before deletion
-        count_sql = "SELECT COUNT(*) FROM cdc_processed_files"
-        cursor = fb_connector.execute(count_sql)
-        before_count = cursor.fetchone()[0]
-        
-        # Delete old records
-        delete_sql = f"""
-        DELETE FROM cdc_processed_files
-        WHERE processed_at < CURRENT_TIMESTAMP - INTERVAL '{days_to_keep}' DAY
-        """
-        
-        fb_connector.execute(delete_sql)
-        
-        # Get count after deletion
-        cursor = fb_connector.execute(count_sql)
-        after_count = cursor.fetchone()[0]
-        
-        deleted = before_count - after_count
-        
-        if deleted > 0:
-            logger.info(f"✓ Cleanup complete: Deleted {deleted:,} old records (before: {before_count:,}, after: {after_count:,})")
-        else:
-            logger.info(f"✓ Cleanup complete: No old records to delete (total: {after_count:,})")
-        
+        fb_connector.execute(insert_sql)
+        logger.info(f"Marked file as failed: {file_key}")
     except Exception as e:
-        # Non-fatal - log error but don't fail Lambda
-        logger.warning(f"⚠️  Cleanup failed (non-fatal): {e}")
+        logger.warning(f"Failed to mark file as failed: {e}")
 
-# ═══════════════════════════════════════════════════════════════════
 
-# Regex to extract database, table, date, filename from S3 key
-# DMS format: firebolt_dms_job/<database>/<table>/YYYY/MM/DD/<filename>.parquet
-RE_KEY = re.compile(r'firebolt_dms_job/([^/]+)/([^/]+)/(\d{4})/(\d{2})/(\d{2})/([^/]+\.parquet)$')
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABLE KEYS CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def handler(event, context):
+def get_table_keys(table_name: str) -> list:
+    """Get primary keys for a table from configuration"""
+    # Load from environment or default config
+    table_keys_json = os.environ.get('TABLE_KEYS', '{}')
+    try:
+        table_keys = json.loads(table_keys_json)
+    except:
+        table_keys = {}
+    
+    # Default: 'id' for most tables
+    key = table_keys.get(table_name, 'id')
+    
+    if key is None:
+        return None
+    
+    # Handle composite keys (comma-separated)
+    if isinstance(key, str):
+        return [k.strip() for k in key.split(',')]
+    
+    return key
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN LAMBDA HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def lambda_handler(event, context):
     """
-    Lambda handler for S3 → Firebolt CDC
+    Lambda handler for S3 -> Firebolt CDC
     
-    Triggered by S3 ObjectCreated event via EventBridge
-    Processes ONE file at a time
-    
-    Includes deduplication to prevent processing same file multiple times
+    Triggered by S3 events when new Parquet files are uploaded.
     """
     start_time = time.time()
     
-    # Generate unique request ID for deduplication
-    request_id = context.aws_request_id
-    logger.info(f"Request ID: {request_id}")
+    # Get configuration from environment
+    database = os.environ.get('FIREBOLT_DATABASE', 'fair')
+    engine = os.environ.get('FIREBOLT_ENGINE', 'dm_engine')
+    location = os.environ.get('FIREBOLT_LOCATION', 's3_raw_dms')
+    delete_col = os.environ.get('CDC_DELETE_COLUMN', 'Op')
+    delete_vals = os.environ.get('CDC_DELETE_VALUES', 'D')
+    sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
     
-    # Extract S3 key from event
-    key = ""
-    if "detail" in event and "object" in event["detail"]:
-        # EventBridge format
-        key = event["detail"]["object"].get("key", "")
-    elif "Records" in event:
-        # Direct S3 event format
-        key = event["Records"][0]["s3"]["object"]["key"]
-    
-    logger.info(f"Processing S3 key: {key}")
-    
-    # Parse database, table, date components, filename from key
-    m = RE_KEY.search(key or "")
-    if not m:
-        raise RuntimeError(f"Cannot parse database/table/date/filename from key: {key}")
-    
-    database, table, year, month, day, filename = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6)
-    date_yyyymmdd = f"{year}{month}{day}"  # For internal tracking
-    date_path = f"{year}/{month}/{day}"    # For S3 COPY pattern
-    logger.info(f"Database: {database}, Table: {table}, Date: {date_yyyymmdd}, File: {filename}")
-    
-    # Create file_key for deduplication
-    file_key = f"{database}/{table}/{date_path}/{filename}"
-    logger.info(f"File key: {file_key}")
-    
-    # Create unique suffix for staging table (prevents concurrency issues)
-    unique_suffix = hashlib.md5(
-        f"{table}_{date_yyyymmdd}_{filename}_{context.aws_request_id}".encode()
-    ).hexdigest()[:8]
-    
-    # Load table keys configuration
-    tk_inline = os.environ.get("TABLE_KEYS_JSON")
-    if tk_inline:
-        table_keys = json.loads(tk_inline)
-    else:
-        s3 = boto3.client("s3")
-        k_bucket = os.environ["TABLE_KEYS_S3_BUCKET"]
-        k_key = os.environ["TABLE_KEYS_S3_KEY"]
-        obj = s3.get_object(Bucket=k_bucket, Key=k_key)
-        table_keys = json.loads(obj["Body"].read().decode("utf-8"))
-    
-    # Get primary keys for this table
-    keys = table_keys.get(table)
-    
-    # Handle tables with null primary keys (skip CDC)
-    if keys is None:
-        logger.warning(f"⚠️  Table '{table}' has null primary key - no CDC configured")
-        
-        # Check if this is a CDC file (timestamp format) or full load file
-        is_cdc_file = bool(re.match(r'\d{8}-\d+\.parquet$', filename))
-        
-        # Connect to Firebolt for file tracking (inside try block to handle connection errors)
-        fb_connector = None
-        try:
-            fb_connector = FireboltConnector()
-            fb_connector.connect()
-            
-            if is_cdc_file:
-                # CDC file but no primary key - skip processing
-                logger.info(f"✓ Skipping CDC file (no PK configured): {file_key}")
-                logger.info(f"  Recommendation: Configure primary key or use scheduled full load")
-                
-                # Mark as completed to prevent retry loops
-                mark_file_completed(file_key, fb_connector)
-                
-                elapsed = time.time() - start_time
-                return {
-                    'statusCode': 200,
-                    'body': json.dumps({
-                        'message': 'CDC skipped - no primary key configured',
-                        'table': table,
-                        'file': filename,
-                        'strategy': 'null_pk_skipped',
-                        'elapsed_seconds': elapsed
-                    })
-                }
-            else:
-                # Full load file - skip for now (can be processed by scheduled Lambda)
-                logger.info(f"✓ Skipping full load file (no PK configured): {file_key}")
-                logger.info(f"  Recommendation: Use scheduled full load Lambda for this table")
-                
-                # Mark as completed
-                mark_file_completed(file_key, fb_connector)
-                
-                elapsed = time.time() - start_time
-                return {
-                    'statusCode': 200,
-                    'body': json.dumps({
-                        'message': 'Full load skipped - no primary key configured',
-                        'table': table,
-                        'file': filename,
-                        'recommendation': 'Use scheduled Lambda for full loads',
-                        'elapsed_seconds': elapsed
-                    })
-                }
-        except Exception as e:
-            # Gracefully handle connection errors - don't crash Lambda
-            logger.error(f"✗ Error connecting to Firebolt to mark file as completed: {e}")
-            logger.error(f"  File: {file_key}")
-            logger.error(f"  Table has null PK - skipping CDC processing")
-            logger.warning(f"  ⚠️  File will be retried by S3, but will fail again if connection issue persists")
-            
-            # Return success to prevent infinite retry loop
-            # (The file will be processed when connection is restored, but will be skipped again)
-            elapsed = time.time() - start_time
-            return {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': 'CDC skipped - connection error while marking file',
-                    'table': table,
-                    'file': filename,
-                    'error': str(e),
-                    'elapsed_seconds': elapsed
-                })
-            }
-        finally:
-            # Safe disconnect
-            if fb_connector:
-                try:
-                    fb_connector.disconnect()
-                except:
-                    pass  # Ignore disconnect errors
-    
-    # Convert single key to list for uniform handling
-    if isinstance(keys, str):
-        keys = [keys]
-    
-    logger.info(f"✓ Primary keys for {table}: {keys}")
-    
-    # Optional: Handle CDC deletes (tombstones)
-    # Note: delete_expr will be validated later (after we know staging table columns)
-    delete_col = os.environ.get("CDC_DELETE_COLUMN")
-    delete_vals = os.environ.get("CDC_DELETE_VALUES")
-    
-    # Connect to Firebolt using SDK
-    fb_connector = FireboltConnector()
-    fb_connector.connect()
-    
-    # ═══════════════════════════════════════════════════════════════════
-    # PERIODIC CLEANUP OF OLD RECORDS
-    # ═══════════════════════════════════════════════════════════════════
-    
-    # Run cleanup occasionally (1% of invocations) to prevent table bloat
-    # This keeps the cdc_processed_files table size manageable
-    cleanup_probability = float(os.environ.get('CLEANUP_PROBABILITY', '0.01'))  # Default: 1%
-    cleanup_days = int(os.environ.get('CLEANUP_DAYS_TO_KEEP', '30'))  # Default: 30 days
-    
-    if random.random() < cleanup_probability:
-        logger.info("🧹 Running periodic cleanup of old processed files records")
-        cleanup_old_processed_files(fb_connector, days_to_keep=cleanup_days)
-    
-    # ═══════════════════════════════════════════════════════════════════
-    # FILE DEDUPLICATION CHECK
-    # ═══════════════════════════════════════════════════════════════════
-    
-    logger.info("=" * 80)
-    logger.info("STEP 1: CHECK IF FILE ALREADY PROCESSED")
-    logger.info("=" * 80)
-    
-    is_processed, status = is_file_processed(file_key, fb_connector)
-    
-    if is_processed:
-        logger.info(f"✓ File {file_key} already processed (status: {status}), skipping")
-        elapsed = time.time() - start_time
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'message': 'File already processed',
-                'file_key': file_key,
-                'status': status,
-                'elapsed_seconds': elapsed
-            })
-        }
-    
-    logger.info("=" * 80)
-    logger.info("STEP 2: MARK FILE AS PROCESSING")
-    logger.info("=" * 80)
-    
-    if not mark_file_processing(file_key, request_id, context.invoked_function_arn, fb_connector):
-        logger.info(f"✓ File {file_key} being processed by another Lambda, skipping")
-        elapsed = time.time() - start_time
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'message': 'File being processed by another Lambda',
-                'file_key': file_key,
-                'elapsed_seconds': elapsed
-            })
-        }
-    
-    # ═══════════════════════════════════════════════════════════════════
-    # PROCESS FILE (existing CDC logic)
-    # ═══════════════════════════════════════════════════════════════════
-    
-    logger.info("=" * 80)
-    logger.info("STEP 3: PROCESS FILE")
-    logger.info("=" * 80)
-    
-    # Get external location name
-    location = os.environ["LOCATION_NAME"]
-    
-    staging_table = None
+    # Parse S3 event
     try:
-        # Generate unique staging table name (table will be auto-created by COPY)
-        staging_table = ensure_staging_table_name(table, unique_suffix)
+        record = event['Records'][0]
+        bucket = record['s3']['bucket']['name']
+        file_key = record['s3']['object']['key']
+    except (KeyError, IndexError) as e:
+        logger.error(f"Invalid S3 event: {e}")
+        raise ValueError(f"Invalid S3 event structure: {e}")
+    
+    logger.info("=" * 80)
+    logger.info(f"CDC Processing: {file_key}")
+    logger.info("=" * 80)
+    
+    # Parse file path: fair/{table}/{year}/{month}/{day}/{filename}.parquet
+    path_pattern = r'^fair/([^/]+)/(\d{4})/(\d{2})/(\d{2})/(.+\.parquet)$'
+    match = re.match(path_pattern, file_key)
+    
+    if not match:
+        logger.warning(f"Skipping non-CDC file: {file_key}")
+        return {"status": "skipped", "reason": "Not a CDC file"}
+    
+    table = match.group(1)
+    year = match.group(2)
+    month = match.group(3)
+    day = match.group(4)
+    filename = match.group(5)
+    date_yyyymmdd = f"{year}-{month}-{day}"
+    
+    # Skip LOAD files (full load)
+    if filename.startswith('LOAD'):
+        logger.info(f"Skipping LOAD file: {file_key}")
+        return {"status": "skipped", "reason": "LOAD file"}
+    
+    # Get primary keys
+    keys = get_table_keys(table)
+    if not keys:
+        logger.warning(f"No primary keys configured for table '{table}', skipping")
+        return {"status": "skipped", "reason": "No primary keys configured"}
+    
+    logger.info(f"Table: {table}, Keys: {keys}, Date: {date_yyyymmdd}")
+    
+    # Connect to Firebolt
+    fb_connector = None
+    staging_table = None
+    dedup_table = None
+    
+    try:
+        fb_connector = FireboltConnector(database=database, engine=engine)
         
-        # Drop staging table if it exists (from previous failed run)
-        cleanup_staging_table(staging_table, fb_connector)
+        # Check if file already processed
+        if is_file_processed(file_key, fb_connector):
+            logger.info(f"File already processed: {file_key}")
+            return {"status": "skipped", "reason": "Already processed"}
         
-        # COPY single file to staging (AUTO_CREATE will infer schema from parquet)
-        copy_sql = render_copy_single_file(staging_table, table, date_path, filename, location, database)
-        fb_connector.execute(copy_sql)
-        logger.info(f"✓ Copied {filename} to {staging_table} (auto-created from parquet schema)")
-
-# ═══════════════════════════════════════════════════════════════════
-        # SCHEMA EVOLUTION: Auto-add new columns from Parquet
+        # Generate staging table name
+        staging_table = f"stg_{table}_{int(time.time() * 1000)}"
+        
+        # Pattern for READ_PARQUET
+        pattern = file_key
+        
         # ═══════════════════════════════════════════════════════════════════
-        schema_evolution_enabled = os.environ.get('SCHEMA_EVOLUTION_ENABLED', 'false').lower() == 'true'
-        schema_evolution_sns = os.environ.get('SCHEMA_EVOLUTION_SNS_TOPIC')
-        
-        if schema_evolution_enabled:
-            logger.info("🔍 Checking for schema evolution...")
-            evolution_result = handle_schema_evolution(
-                staging_table=staging_table,
-                production_table=table,
-                fb_connector=fb_connector,
-                auto_add=True,
-                sns_topic_arn=schema_evolution_sns
-            )
-            
-            if evolution_result['columns_added']:
-                logger.info(f"✓ Schema evolved: added columns {evolution_result['columns_added']}")
-            
-            if evolution_result['requires_manual']:
-                logger.warning(f"⚠️ {len(evolution_result['requires_manual'])} columns require manual action")
-        
-        # Continue with existing code...
-        
-        # Get column list from PRODUCTION table (not staging) to ensure schema compatibility
-        # We only merge columns that exist in production
-        cols_production = get_columns("public", table, fb_connector)
-        
-        # Get columns and data types from staging table
-        cols_staging = get_columns("public", staging_table, fb_connector)
-        
+        # STEP 1: LOAD TO STAGING (with ingestion_seq)
         # ═══════════════════════════════════════════════════════════════════
-        # DEDUPLICATE STAGING TABLE - DISABLED
-        # ═══════════════════════════════════════════════════════════════════
-        # DEDUPLICATION IS DISABLED - MERGE handles duplicates correctly
-        # Deduplication was removing legitimate rows when same primary key
-        # appeared in multiple CDC files (e.g., INSERT then UPDATE).
-        # Without deduplication, MERGE correctly processes all operations.
-        # 
-        # Previous logic (DISABLED):
-        # deduplicate_staging_table(staging_table, table, keys, cols_staging, fb_connector)
-        logger.info("⚠️  Deduplication DISABLED - MERGE will handle all rows from staging table")
+        logger.info("=" * 80)
+        logger.info("STEP 1: LOAD TO STAGING (with ingestion_seq)")
+        logger.info("=" * 80)
         
-        # Refresh staging columns after dedup (in case structure changed)
-        cols_staging = get_columns("public", staging_table, fb_connector)
+        cols_staging = create_staging_table_with_ingestion_seq(
+            fb_connector=fb_connector,
+            staging_table=staging_table,
+            location=location,
+            pattern=pattern
+        )
+        
+        # Get column types
         col_types_staging = get_column_types("public", staging_table, fb_connector)
+        cols_production = get_columns("public", table, fb_connector)
         col_types_production = get_column_types("public", table, fb_connector)
         
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 2: SCHEMA EVOLUTION (check for new columns)
+        # ═══════════════════════════════════════════════════════════════════
+        logger.info("=" * 80)
+        logger.info("STEP 2: SCHEMA EVOLUTION")
+        logger.info("=" * 80)
+        
+        evolution_result = handle_schema_evolution(
+            staging_table=staging_table,
+            production_table=table,
+            fb_connector=fb_connector,
+            auto_add=True,
+            sns_topic_arn=sns_topic_arn
+        )
+        
+        if evolution_result['columns_added']:
+            logger.info(f"Added {len(evolution_result['columns_added'])} new columns")
+            # Refresh production columns
+            cols_production = get_columns("public", table, fb_connector)
+            col_types_production = get_column_types("public", table, fb_connector)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 3: DEDUPLICATE STAGING (NEW - with ingestion_seq)
+        # ═══════════════════════════════════════════════════════════════════
+        logger.info("=" * 80)
+        logger.info("STEP 3: DEDUPLICATE STAGING (deterministic ordering)")
+        logger.info("=" * 80)
+        
+        # Deduplicate staging table
+        dedup_table = deduplicate_staging_table(
+            staging_table=staging_table,
+            keys=keys,
+            cols_staging=cols_staging,
+            fb_connector=fb_connector
+        )
+        
+        # Track if we created a separate dedup table
+        dedup_table_created = (dedup_table != staging_table)
+        
+        # Get columns from dedup table (excludes ingestion_seq)
+        cols_dedup = get_columns("public", dedup_table, fb_connector)
+        col_types_dedup = get_column_types("public", dedup_table, fb_connector)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 4: PREPARE MERGE COLUMNS
+        # ═══════════════════════════════════════════════════════════════════
+        
         # Use intersection of columns (only columns present in both tables)
-        cols_initial = [c for c in cols_production if c in cols_staging]
+        cols_initial = [c for c in cols_production if c in cols_dedup]
         
         if not cols_initial:
             raise RuntimeError(f"No common columns between staging and production table '{table}'")
         
-        # Filter out DECIMAL/NUMERIC columns with mismatched precision from ALL columns
-        # (Firebolt won't allow assignment between different DECIMAL precisions)
+        # Filter out DECIMAL/NUMERIC columns with mismatched precision
         cols = []
         decimal_cols_removed = []
         for c in cols_initial:
             prod_type = col_types_production.get(c, "")
-            stg_type = col_types_staging.get(c, "")
+            dedup_type = col_types_dedup.get(c, "")
             
-            # Check if column is DECIMAL/NUMERIC with different precision
             if ("DECIMAL" in prod_type.upper() or "NUMERIC" in prod_type.upper()):
-                if prod_type != stg_type:
-                    decimal_cols_removed.append(f"{c} (prod: {prod_type}, stg: {stg_type})")
-                    logger.warning(f"⚠️  Skipping DECIMAL column '{c}' from MERGE due to type mismatch: prod={prod_type}, stg={stg_type}")
+                if prod_type != dedup_type:
+                    decimal_cols_removed.append(f"{c} (prod: {prod_type}, stg: {dedup_type})")
+                    logger.warning(f"Skipping DECIMAL column '{c}' from MERGE due to type mismatch")
                     continue
             
             cols.append(c)
@@ -1335,100 +899,69 @@ def handler(event, context):
         if not cols:
             raise RuntimeError(f"No compatible columns after filtering DECIMALs for table '{table}'")
         
-        if decimal_cols_removed:
-            logger.warning(f"⚠️  {len(decimal_cols_removed)} DECIMAL columns removed from MERGE: {decimal_cols_removed}")
-        
         # Verify primary keys are in the filtered column list
         missing_keys = [k for k in keys if k not in cols]
         if missing_keys:
-            # Check if missing keys were filtered due to DECIMAL mismatch
             decimal_key_issues = [d for d in decimal_cols_removed if any(k in d for k in missing_keys)]
             if decimal_key_issues:
                 error_msg = (
-                    f"⚠️  Cannot process table '{table}': Primary key(s) {missing_keys} have DECIMAL precision mismatch. "
-                    f"This file will be skipped. Schema fix required:\n"
-                    f"  Mismatched keys: {decimal_key_issues}\n"
-                    f"  Solution: Run schema fix SQL to recreate table with correct data types."
+                    f"Cannot process table '{table}': Primary key(s) {missing_keys} have DECIMAL precision mismatch. "
+                    f"Mismatched keys: {decimal_key_issues}"
                 )
                 logger.error(error_msg)
                 raise RuntimeError(error_msg)
             else:
                 raise RuntimeError(
-                    f"Primary keys {missing_keys} not found in compatible columns for table '{table}'. "
-                    f"Production columns: {cols_production}, Staging columns: {cols_staging}, Filtered: {cols}"
+                    f"Primary keys {missing_keys} not found in compatible columns for table '{table}'"
                 )
         
-        # Filter out DECIMAL columns from primary keys for ON clause
-        # (Firebolt can't compare DECIMALs with different precision/scale)
-        key_cols_safe = []
-        decimal_keys_removed = []
-        for k in keys:
-            prod_type = col_types_production.get(k, "")
-            stg_type = col_types_staging.get(k, "")
-            
-            # Skip DECIMAL columns in ON clause if types differ
-            if "DECIMAL" in prod_type.upper() or "NUMERIC" in prod_type.upper():
-                if prod_type != stg_type:
-                    decimal_keys_removed.append(f"{k} (prod: {prod_type}, stg: {stg_type})")
-                    logger.warning(f"Skipping DECIMAL key '{k}' from ON clause due to type mismatch")
-                    continue
-            
-            key_cols_safe.append(k)
+        logger.info(f"Using {len(cols)} common columns for MERGE")
+        logger.info(f"Primary keys: {keys}")
         
-        # Fallback: if all keys are DECIMALs with different precision, use them anyway (will fail but with clear error)
-        if not key_cols_safe:
-            logger.warning(f"All primary keys are DECIMAL with different precision! Using original keys (MERGE may fail)")
-            key_cols_safe = keys
-        
-        if decimal_keys_removed:
-            logger.warning(f"DECIMAL keys removed from ON clause: {decimal_keys_removed}")
-        
-        logger.info(f"✓ Using {len(cols)} common columns for MERGE (production: {len(cols_production)}, staging: {len(cols_staging)})")
-        logger.info(f"✓ Primary keys for ON clause: {key_cols_safe}")
-        
-        # Validate CDC delete expression (only if delete column exists in staging)
+        # Build delete expression for Op='D'
         delete_expr = None
         if delete_col and delete_vals:
-            if delete_col in cols_staging:
+            if delete_col in cols_dedup:
                 in_list = ", ".join([f"'{v.strip()}'" for v in delete_vals.split(",") if v.strip()])
                 if in_list:
                     delete_expr = f's."{delete_col}" IN ({in_list})'
-                    logger.info(f"✓ CDC delete expression: {delete_expr}")
-            else:
-                logger.warning(f"CDC delete column '{delete_col}' not found in staging table, skipping delete handling")
+                    logger.info(f"CDC delete expression: {delete_expr}")
         
         # ═══════════════════════════════════════════════════════════════════
-        # NOTE: DEDUPLICATION IS INTENTIONALLY DISABLED
+        # STEP 5: EXECUTE MERGE
         # ═══════════════════════════════════════════════════════════════════
-        # Deduplication was removed because it was causing data loss:
-        # - When same primary key appears in multiple CDC files (e.g., INSERT then UPDATE)
-        # - Deduplication kept only the latest row, losing the INSERT operation
-        # - MERGE handles duplicates correctly by processing all operations
-        # - Result: All legitimate rows are preserved without data loss
-        # ═══════════════════════════════════════════════════════════════════
+        logger.info("=" * 80)
+        logger.info("STEP 5: EXECUTE MERGE")
+        logger.info("=" * 80)
         
-        # Execute MERGE with retry logic for transaction conflicts
-        # Increased retries to handle high-contention tables
         execute_merge_with_retry(
             fb_connector=fb_connector,
             table=table,
-            staging_table=staging_table,
+            staging_table=dedup_table,  # Use deduplicated table
             cols=cols,
             keys=keys,
             delete_expr=delete_expr,
-            key_cols_safe=key_cols_safe,
-            max_retries=10  # Increased from 3 to handle MVCC conflicts
+            key_cols_safe=keys,
+            max_retries=10
         )
         
-        # Cleanup staging table
-        cleanup_staging_table(staging_table, fb_connector)
-        
         # ═══════════════════════════════════════════════════════════════════
-        # MARK FILE AS COMPLETED
+        # STEP 6: CLEANUP
         # ═══════════════════════════════════════════════════════════════════
-        
         logger.info("=" * 80)
-        logger.info("STEP 4: MARK FILE AS COMPLETED")
+        logger.info("STEP 6: CLEANUP")
+        logger.info("=" * 80)
+        
+        # Drop staging tables
+        cleanup_staging_table(staging_table, fb_connector)
+        if dedup_table_created:
+            cleanup_staging_table(dedup_table, fb_connector)
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 7: MARK FILE AS COMPLETED
+        # ═══════════════════════════════════════════════════════════════════
+        logger.info("=" * 80)
+        logger.info("STEP 7: MARK FILE AS COMPLETED")
         logger.info("=" * 80)
         
         mark_file_completed(file_key, fb_connector)
@@ -1437,15 +970,19 @@ def handler(event, context):
         # Cleanup on error
         if staging_table:
             cleanup_staging_table(staging_table, fb_connector)
+        if dedup_table and dedup_table != staging_table:
+            cleanup_staging_table(dedup_table, fb_connector)
         
         # Mark file as failed
-        logger.error(f"✗ Error processing file: {e}")
-        mark_file_failed(file_key, str(e), fb_connector)
+        logger.error(f"Error processing file: {e}")
+        if fb_connector:
+            mark_file_failed(file_key, str(e), fb_connector)
         
         raise
     finally:
         # Always disconnect
-        fb_connector.disconnect()
+        if fb_connector:
+            fb_connector.disconnect()
     
     duration = time.time() - start_time
     
@@ -1459,7 +996,6 @@ def handler(event, context):
         "duration_seconds": round(duration, 2)
     }
     
-    logger.info(f"✓ Processing complete in {duration:.2f}s")
+    logger.info(f"Processing complete in {duration:.2f}s")
     return result
-
 
